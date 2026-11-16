@@ -1,9 +1,9 @@
 """
-TCP sunucusu: her client bağlantısı için ayrı bir thread açar.
+TCP server: starts a separate thread for every client connection.
 
-Akış:  satır oku -> ayrıştır (protocol.py) -> Store'a uygula -> cevap satırını gönder
+Flow:  read line -> parse (protocol.py) -> apply to Store -> send response line
 
-Çalıştırma (depo kökünden):
+Run (from the repository root):
     python -m server.server --port 5000
 """
 
@@ -24,17 +24,18 @@ log = logging.getLogger("server")
 
 
 def execute(store, line):
-    """Tek bir istek satırını işler ve cevap satırını (sonunda \\n olmadan) döndürür.
+    """Process a single request line and return the response line (without trailing \\n).
 
-    Ağdan bağımsızdır; bu yüzden soket olmadan da test edilebilir.
+    Independent of the network, so it can be tested without a socket.
     """
     req = parse_line(line)
     if not req.ok:
         return req.error                 # ERR KEY / ERR VALUE / ERR UNKNOWN
 
     if req.cmd == CMD_SET:
-        err = store.set(req.key, req.value)
-        return err if err else RESP_OK   # err burada yalnızca ERR FULL olabilir
+        # set() returns (err, seq); seq is used for replication from Level 2 on
+        err, seq = store.set(req.key, req.value)
+        return err if err else RESP_OK
 
     if req.cmd == CMD_GET:
         value = store.get(req.key)
@@ -43,41 +44,41 @@ def execute(store, line):
     if req.cmd == CMD_STATS:
         return format_stats(store.count())
 
-    return ERR_UNKNOWN                   # buraya normalde ulaşılmaz
+    return ERR_UNKNOWN                   # normally unreachable
 
 
 def handle_client(conn, addr, store):
-    """Bir client bağlantısına hizmet eder. Her bağlantı için ayrı bir thread'de çalışır."""
+    """Serve one client connection. Runs in its own thread, one per connection."""
     log.info("baglandi: %s:%s", addr[0], addr[1])
     try:
-        # Soketi dosya gibi sar: readline() TCP bayt akışından tam satırlar çıkarır (framing).
-        # newline="\n": satırlar yalnızca \n'de bölünür, \r çevrilmez.
+        # Wrap the socket like a file: readline() extracts complete lines from the TCP byte stream (framing).
+        # newline="\n": lines are split only at \n, \r is not translated.
         reader = conn.makefile("r", encoding=ENCODING, newline="\n")
         while True:
             try:
                 line = read_line(reader)
             except LineTooLongError:
-                # Protokol: çok uzun satırda ERR VALUE gönder ve bağlantıyı kapat
+                # Protocol: on an over-long line send ERR VALUE and close the connection
                 conn.sendall(encode_line(ERR_VALUE))
                 break
             except UnicodeDecodeError:
-                # Geçerli UTF-8 olmayan baytlar: akış artık güvenilir değil, kapat
+                # Bytes that are not valid UTF-8: the stream can no longer be trusted, close it
                 conn.sendall(encode_line(ERR_UNKNOWN))
                 break
 
-            if line is None:             # client bağlantıyı kapattı
+            if line is None:             # client closed the connection
                 break
 
             try:
                 response = execute(store, line)
-            except Exception:            # beklenmeyen hata sunucuyu düşürmemeli
+            except Exception:            # an unexpected error must not bring the server down
                 log.exception("istek islenirken hata")
                 response = ERR_UNKNOWN
 
-            # send() verinin tamamını göndermeyebilir; sendall() hepsini gönderir
+            # send() may transmit only part of the data; sendall() sends all of it
             conn.sendall(encode_line(response))
     except (ConnectionError, OSError) as e:
-        # Client aniden koptu (ör. Ctrl+C): yalnızca bu thread biter, sunucu çalışmaya devam eder
+        # Client disconnected abruptly (e.g. Ctrl+C): only this thread ends, the server keeps running
         log.info("baglanti koptu: %s:%s (%s)", addr[0], addr[1], e)
     finally:
         conn.close()
@@ -85,13 +86,13 @@ def handle_client(conn, addr, store):
 
 
 def serve(host, port, store):
-    """Dinleyen soketi açar ve Ctrl+C gelene kadar bağlantı kabul eder."""
+    """Open the listening socket and accept connections until Ctrl+C."""
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    # Sunucu yeniden başlatılınca "Address already in use" hatası almamak için (bind'dan ÖNCE)
+    # Avoid "Address already in use" when the server is restarted (must be set BEFORE bind)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((host, port))
-    srv.listen(512)                      # bekleme kuyruğu: 300 client aynı anda bağlanabilsin
-    # accept() en geç 1 sn'de bir döner; Windows'ta Ctrl+C ancak böyle yakalanır
+    srv.listen(512)                      # backlog: lets 300 clients connect at the same time
+    # accept() returns after 1 s at the latest; on Windows this is the only way Ctrl+C is noticed
     srv.settimeout(1.0)
     log.info("dinleniyor: %s:%s", host, port)
 
@@ -100,9 +101,9 @@ def serve(host, port, store):
             try:
                 conn, addr = srv.accept()
             except socket.timeout:
-                continue                 # kimse bağlanmadı, döngüye devam
-            conn.settimeout(None)        # client soketinde timeout yok (shell boşta bekleyebilir)
-            # daemon=True: ana program kapanınca açık bağlantılar programı bekletmez
+                continue                 # nobody connected, keep looping
+            conn.settimeout(None)        # no timeout on the client socket (a shell may sit idle)
+            # daemon=True: open connections do not keep the program alive at shutdown
             t = threading.Thread(target=handle_client, args=(conn, addr, store), daemon=True)
             t.start()
     except KeyboardInterrupt:
@@ -117,14 +118,14 @@ def main():
     parser.add_argument("--port", type=int, required=True, help="dinlenecek port")
     args = parser.parse_args()
 
-    # Log satırlarının başına port yazılır; birden fazla sunucunun çıktısı ayırt edilebilsin
+    # Each log line starts with the port so the output of several servers can be told apart
     logging.basicConfig(level=logging.INFO, format=f"%(asctime)s [{args.port}] %(message)s", datefmt="%H:%M:%S")
 
     try:
         serve(args.host, args.port, Store())
     except OSError as e:
-        # Örn. port başka bir program tarafından kullanılıyor
-        log.error("sunucu baslatilamadi: %s", e) #T0DO türkçeden çevrilecek
+        # E.g. the port is already in use by another program
+        log.error("sunucu baslatilamadi: %s", e)  # TODO: translate log and help texts from Turkish
         raise SystemExit(1)
 
 

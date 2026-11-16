@@ -31,3 +31,14 @@
 
 - Hocaya sorulacak: key tam 16 mı en fazla 16 mı; 4.080 karakter mi bayt mı; 3 kişilik grup olur mu.
 - `protokol.md` ekipçe gözden geçirilecek.
+
+
+
+## 2026-11-16 (Öğrenci1, Level 2 Aşama A)
+
+- **Karar:** Store her key için (value, seq) saklıyor. seq sayacı kilit altında artıyor; "kontrol, numara ver, yaz" tek kilit bloğunda.
+- **Karar:** Başarısız SET (ERR KEY, ERR VALUE, ERR FULL) seq harcamıyor.
+- **Karar:** apply_replicated yalnızca gelen seq saklanandan büyükse yazıyor (>=: aynı mesaj iki kez gelebilir).
+- **Karar:** apply_replicated deponun kendi sayacını değiştirmiyor; backup numara üretmez. Level 5'te bir backup primary olursa sayacın yükseltilmesi gerekecek.
+- **Hata:** execute(), set()'in döndürdüğü çifti ayırmadan "hata var mı" diye sınıyordu; içi dolu bir çift her zaman doğru sayıldığı için her SET hatalı görünürdü.
+- **Ders:** Etkileşimli Python oturumu dosyanın eski hâlini bellekte tutar; değişiklikten sonra yeniden başlatmak gerekir.
