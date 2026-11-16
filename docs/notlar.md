@@ -42,3 +42,15 @@
 - **Karar:** apply_replicated deponun kendi sayacını değiştirmiyor; backup numara üretmez. Level 5'te bir backup primary olursa sayacın yükseltilmesi gerekecek.
 - **Hata:** execute(), set()'in döndürdüğü çifti ayırmadan "hata var mı" diye sınıyordu; içi dolu bir çift her zaman doğru sayıldığı için her SET hatalı görünürdü.
 - **Ders:** Etkileşimli Python oturumu dosyanın eski hâlini bellekte tutar; değişiklikten sonra yeniden başlatmak gerekir.
+
+
+## 2026-11-16 (Öğrenci1, Level 2 Aşama B)
+
+- **Karar:** Replicator her backup için ayrı bir KVClient ve ayrı bir kilit tutuyor. Ortak tek kilit olsaydı yavaş bir backup diğerine gönderimi de bekletirdi.
+- **Karar:** Ulaşılamayan (1 sn timeout) ya da REPL'e OK dışında cevap veren backup "behind" oluyor ve mark_alive çağrılana kadar atlanıyor. Atlanmasaydı her SET ölü backup için 1 sn beklerdi.
+- **Karar:** replicate() istisna fırlatmıyor; bir backup sorunu client'ın SET'ini bozmamalı.
+- **Karar:** Primary, store.set döndükten (depo kilidi bırakıldıktan) sonra replicate çağırıyor; ağ işlemi kilit altında yapılmıyor. Bedeli: aynı key'e iki SET backup'a ters sırayla varabilir, apply_replicated'deki seq karşılaştırması bunu çözüyor.
+- **Karar:** Senkron replikasyon: client'a OK, ulaşılabilen backup'lar cevap verdikten sonra dönüyor.
+- **Gözlem:** İki backup kapalıyken ilk SET yaklaşık 2 sn sürdü (backup başına 1 sn), sonraki SET'ler anında döndü.
+- **Hata:** Testlerde ResourceWarning (unclosed socket): Replicator bağlantıları kapatmıyordu. Replicator.close() eklendi.
+- **Açık:** Backup rolü (ERR NOT_PRIMARY, REPL uygulama) protocol.py 1.1'i, SYNC çağrıları sync.py'yi bekliyor.
