@@ -54,3 +54,18 @@
 - **Gözlem:** İki backup kapalıyken ilk SET yaklaşık 2 sn sürdü (backup başına 1 sn), sonraki SET'ler anında döndü.
 - **Hata:** Testlerde ResourceWarning (unclosed socket): Replicator bağlantıları kapatmıyordu. Replicator.close() eklendi.
 - **Açık:** Backup rolü (ERR NOT_PRIMARY, REPL uygulama) protocol.py 1.1'i, SYNC çağrıları sync.py'yi bekliyor.
+
+
+## 2026-11-17 (Öğrenci1, Level 2 Aşama C: race_demo)
+
+- **Deney:** `python -m tests.race_demo --runs 500` (Windows, Python 3.11.9). 300 thread aynı anda 300 yeni key ekliyor, sınır 256, her varyant 500 tekrar.
+
+| Varyant | 256'yı aşan çalıştırma | Oran | En az | En çok |
+|---|---|---|---|---|
+| Store (kilitli) | 0/500 | %0 | 256 | 256 |
+| UnsafeStore (kilitsiz) | 0/500 | %0 | 256 | 256 |
+| UnsafeStore (kilitsiz, pencere genişletilmiş) | 476/500 | %95,2 | 256 | 286 |
+
+- **Gözlem:** Kilitsiz depo, pencere genişletilmeden 500 denemede hiç hata vermedi. Hata kodda var ama görünmüyor: Python thread'leri seyrek değiştirdiği için kontrol ile yazma arasına başka bir thread nadiren giriyor.
+- **Gözlem:** Kontrol ile yazma arasına `time.sleep(0)` konunca (pencere bilerek genişletildi) 500 çalıştırmanın 476'sında sınır aşıldı, en fazla 286 kayıt oluştu (30 fazla). Kalan 24 çalıştırmada yarış yine oluşmadı.
+- **Ders:** Yarış hatası testte görünmeyebilir; "500 kez denedim, çalıştı" kanıt değildir. Doğruluğu kilit garanti eder.
