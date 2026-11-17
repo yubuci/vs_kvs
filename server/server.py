@@ -23,6 +23,14 @@ from common.protocol import (
 from server.replication import Replicator
 from server.store import Store
 
+# server/sync.py belongs to another branch (level2-sync). Until it is merged the server
+# starts without SYNC; once the file exists the calls below become active automatically.
+# TODO: turn this into a plain import when sync.py is on main.
+try:
+    from server.sync import pull_sync
+except ImportError:
+    pull_sync = None
+
 log = logging.getLogger("server")
 
 ROLE_PRIMARY = "primary"
@@ -127,8 +135,33 @@ def handle_client(conn, addr, node):
         log.info("ayrildi: %s:%s", addr[0], addr[1])
 
 
-def serve(host, port, node):
-    """Open the listening socket and accept connections until Ctrl+C."""
+def sync_from_primary(node, my_port):
+    """Backup start-up: fetch the whole store from the primary. Runs in its own thread.
+
+    Must run while the server is ALREADY accepting connections: the primary marks this
+    backup alive at the start of the SYNC and may send REPL immediately. If the backup
+    were not listening yet, the primary would time out and mark it behind again.
+    """
+    if pull_sync is None:
+        log.warning("server/sync.py is not available yet: starting without SYNC")
+        return
+    host, port = node.primary
+    try:
+        count = pull_sync(host, port, my_port, node.store)
+        log.info("SYNC finished: %s entries received from %s:%s", count, host, port)
+    except Exception:                    # pull_sync should not raise; a failed SYNC must not stop the backup
+        log.exception("SYNC with %s:%s failed", host, port)
+
+
+def serve(host, port, node, on_ready=None, stop_event=None):
+    """Open the listening socket and accept connections until Ctrl+C (or stop_event is set).
+
+    on_ready    optional function, started in its own thread as soon as the socket is
+                listening, so it runs while connections are already being accepted
+                (a backup uses it for its start-up SYNC)
+    stop_event  optional threading.Event; setting it ends the loop within about 1 s
+                (used by tests; a normal server is stopped with Ctrl+C)
+    """
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     # Avoid "Address already in use" when the server is restarted (must be set BEFORE bind)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -138,8 +171,13 @@ def serve(host, port, node):
     srv.settimeout(1.0)
     log.info("dinleniyor: %s:%s", host, port)
 
+    if on_ready is not None:
+        # From here on connections are queued by the OS and accepted by the loop below,
+        # so on_ready may already cause other servers to connect to us
+        threading.Thread(target=on_ready, daemon=True).start()
+
     try:
-        while True:
+        while stop_event is None or not stop_event.is_set():
             try:
                 conn, addr = srv.accept()
             except socket.timeout:
@@ -188,8 +226,14 @@ def main():
     if args.role:
         log.info("role: %s, peers: %s, primary: %s", args.role, peers, primary)
 
+    # A backup fetches the store from the primary right after it started listening
+    on_ready = None
+    if args.role == ROLE_BACKUP:
+        def on_ready():
+            sync_from_primary(node, args.port)
+
     try:
-        serve(args.host, args.port, node)
+        serve(args.host, args.port, node, on_ready=on_ready)
     except OSError as e:
         # E.g. the port is already in use by another program
         log.error("sunucu baslatilamadi: %s", e)  # TODO: translate log and help texts from Turkish
