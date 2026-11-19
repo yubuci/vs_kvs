@@ -1,0 +1,7 @@
+{
+  "servers": [
+    {"host": "127.0.0.1", "port": 5000, "role": "primary"},
+    {"host": "127.0.0.1", "port": 5001, "role": "backup"},
+    {"host": "127.0.0.1", "port": 5002, "role": "backup"}
+  ]
+}

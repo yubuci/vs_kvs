@@ -69,3 +69,21 @@
 - **Gözlem:** Kilitsiz depo, pencere genişletilmeden 500 denemede hiç hata vermedi. Hata kodda var ama görünmüyor: Python thread'leri seyrek değiştirdiği için kontrol ile yazma arasına başka bir thread nadiren giriyor.
 - **Gözlem:** Kontrol ile yazma arasına `time.sleep(0)` konunca (pencere bilerek genişletildi) 500 çalıştırmanın 476'sında sınır aşıldı, en fazla 286 kayıt oluştu (30 fazla). Kalan 24 çalıştırmada yarış yine oluşmadı.
 - **Ders:** Yarış hatası testte görünmeyebilir; "500 kez denedim, çalıştı" kanıt değildir. Doğruluğu kilit garanti eder.
+
+## 2026-11-18 (Öğrenci2, Level 2 Aşama A ve B: protokol, config, client)
+
+- **Karar:** `seq` ve `port` için tek bir katı ayrıştırıcı (`_parse_positive_int`): yalnızca ASCII rakam, değer ≥ 1, port ≤ 65535. İşaret, boşluk, alt çizgi ve ASCII olmayan rakam reddedilir. Baştaki sıfır bilinçli olarak kabul edilir (`007` = 7).
+- **Ders:** `int()` ağdan gelen veri için fazla hoşgörülü: `int("+7")`, `int(" 7 ")`, `int("1_000")` ve `int("٧")` çalışır. `"٧".isdigit()` de `True` döner; doğru kontrol `isascii()` ve `isdigit()` birlikte. Protokol sınırında bir mesajın tek bir geçerli yazılışı olmalı.
+- **Karar:** `REPL` kontrol sırası komut → seq → key → value. Eksik seq `ERR UNKNOWN`, eksik key `ERR KEY`, eksik value `ERR VALUE` (SET ile aynı mantık).
+- **Karar:** Argümansız `SYNC` artık `ERR UNKNOWN` (sürüm 1.0'dan kasıtlı kırılma; `SYNC <port>` şart). Sondaki boşluklu `SYNC 5001 ` da reddedilir.
+- **Karar:** `parse_line` REPL için `validate_key` ve `validate_value` kullanıyor. Ağdan gelen veri depoya girmeden doğrulanır (`apply_replicated` kendisi doğrulamaz).
+- **Gözlem:** `parse_entry` `END` ve bozuk satır için aynı `None` değerini döndürüyor; ikisini ayırt edemiyor. Çağıran (`pull_sync`) önce `line == RESP_END` kontrolünü yapmalı. Docstring'e ve protokol.md'ye yazıldı.
+- **Hesap:** En uzun REPL satırı 5 + 19 + 1 + 16 + 1 + 4080 = 4122, ENTRY 4123; ikisi de `MAX_LINE_LEN` = 4200'ün altında (19 hane: seq ≤ 2^63−1 varsayımı). `TestLineLength` bunu test ediyor.
+- **Karar:** `config.py`'de tüm doğrulama `load_servers` içinde (tek yer); `primary_of` ve `backups_of` basit kalıyor. Hatalar tek bir `ConfigError` ile bildirilir, client traceback yerine mesaj yazar.
+- **Hata (yakalanan tuzak):** Python'da `bool`, `int`'in alt sınıfı; `"port": true` `isinstance(port, int)` kontrolünden geçerdi. Açıkça dışlandı ve test edildi.
+- **Karar:** Yönlendirme kararı client'ta (`ClusterClient`). SET ise primary'ye, değilse ilk ulaşılabilir sunucuya. Sadece ilk kelimeye bakılır; key/value kuralları client'ta tekrarlanmaz.
+- **Karar:** `ERR NOT_PRIMARY <port>` yalnızca BİR kez izlenir. İki sunucu birbirini gösterirse (yanlış yapılandırma) sonsuz döngü olmaz; ikinci NOT_PRIMARY olduğu gibi döndürülür.
+- **Karar:** Primary'ye ulaşılamazsa SET hata verir, GET backup'tan gelir. Failover yok: yeni primary seçilmez (Level 5'in gerekçesi).
+- **Hata/Düzeltme:** `KVClient.send_command` zaman aşımında da bir kez yeniden deniyordu. Takılı kalmış bir backup için `Replicator`'da bekleme 1 sn yerine 2 sn oluyordu. Çözüm: zaman aşımı için `KVTimeout` (KVError'un alt sınıfı); zaman aşımında yeniden deneme yok, kopan bağlantıda hâlâ bir kez deneniyor.
+- **Yöntem:** Her test yazıldıktan sonra kodu bilerek bozup testin kırmızıya döndüğünü doğruladık (mutasyon denemesi): `isascii()` kaldırma, REPL'de kontrol sırasını değiştirme, port aralığını kaldırma, yönlendirmeyi döngüye çevirme, zaman aşımında yeniden denemeyi geri koyma, `bool` portu kabul etme, SET'i ilk sunucuya yollama. Hepsi en az bir testi kırdı.
+- **Açık:** Failover demosu (primary'yi kapat → GET çalışıyor, SET ne dönüyor) gerçek üç sunucuyla yapılıp sonucu buraya yazılacak. Client tarafı testle doğrulandı (`test_primary_down_set_fails_but_get_works_from_backup`); gerçek küme Öğrenci1 (backup rolü) ve Öğrenci3 (sync) birleşince denenebilir.
