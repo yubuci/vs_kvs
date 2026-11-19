@@ -102,3 +102,13 @@
 - **Hata (platform farkı):** `test_primary_kapali` Linux'ta geçti, Windows'ta başarısız oldu (2,03 sn, sınır 2,0 sn). Linux kimsenin dinlemediği bir porta bağlantıyı anında reddediyor; Windows birkaç kez yeniden deneyip "reddedildi" hatasını ancak ~2 sn sonra veriyor. Test "hemen döner" yerine "timeout'u aşmadan, istisnasız 0 döner" kontrol edecek şekilde düzeltildi (`pull_sync(..., timeout=1.0)`).
 - **Ders:** Zamana bağlı testleri tek bir işletim sisteminde çalıştırmak platforma özgü varsayımları gizler. Öğrenci1'in "iki backup kapalıyken ilk SET ~2 sn sürdü" gözlemi de bununla ilgili: Windows'ta ölü bir backup'ı fark etmek timeout'a (1 sn) kadar sürüyor. Gecikme ölçümlerinde işletim sistemi raporda belirtilmeli.
 - **Durum:** Gerçek kümede backup'lar açılışta SYNC deniyor; primary SYNC'i henüz `serve_sync`'e yönlendirmediği için `ERR UNKNOWN` dönüyor, backup uyarı loglayıp devam ediyor. Bekleyen: `server.py`'de `handle_client` içinde SYNC → `serve_sync` bağlantısı (Öğrenci1).
+
+
+
+
+## 2026-11-19 (Öğrenci1, Level 2: backup rolü ve SYNC bağlantısı)
+
+- **Karar:** Backup'a gelen client `SET`'i `ERR NOT_PRIMARY <primary portu>` alıyor; `REPL` → `apply_replicated` → `OK` (depo doluysa `ERR FULL`).
+- **Karar:** Primary'de `SYNC <port>`, `handle_client` içinde `serve_sync`'e veriliyor (çok satırlı cevap); backup host'u bağlantının adresinden, portu istekten alınıyor.
+- **Karar:** Yanlış role gelen istek (primary'ye ya da rolsüz sunucuya `REPL`, backup'a ya da rolsüz sunucuya `SYNC`) `ERR UNKNOWN` alıyor. Yeni bir kural değil: protokol.md bölüm 3'teki "bilinmeyen komut → ERR UNKNOWN" kuralı uygulanıyor.
+- **Gözlem (gerçek küme, 1 primary + 2 backup):** 100 SET sonrası üç sunucuda da STATS 100; backup kapatılıp 50 SET yapıldı, yeniden açılınca SYNC sonrası üçü de eşit; yazma sürerken yeniden başlatılan backup da primary ile aynı; primary kapalıyken GET backup'tan çalıştı, SET hata verdi.

@@ -10,7 +10,7 @@ import logging
 import threading
 
 from client.client import KVClient, KVError
-from common.protocol import RESP_OK
+from common.protocol import RESP_OK, format_repl
 
 log = logging.getLogger("replication")
 
@@ -45,8 +45,7 @@ class Replicator:
 
         Must be called AFTER the store lock was released: this does network I/O.
         """
-        # Temporary: replace with format_repl(seq, key, value) once protocol.py has it
-        line = f"REPL {seq} {key} {value}"
+        line = format_repl(seq, key, value)
 
         for addr, peer in self._peers.items():
             # Read the status under the status lock, then release it before any network I/O

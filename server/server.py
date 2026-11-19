@@ -3,6 +3,11 @@ TCP server: starts a separate thread for every client connection.
 
 Flow:  read line -> parse (protocol.py) -> apply to Store -> send response line
 
+Roles (Level 2):
+    standalone  no --role: Level 1 behaviour
+    primary     accepts SET, replicates every write (REPL), serves SYNC to backups
+    backup      rejects client SET (ERR NOT_PRIMARY <port>), applies REPL, pulls SYNC at start-up
+
 Run (from the repository root):
     python -m server.server --port 5000                                   # standalone (Level 1)
     python -m server.server --port 5000 --role primary --peers 127.0.0.1:5001,127.0.0.1:5002
@@ -15,21 +20,14 @@ import socket
 import threading
 
 from common.protocol import (
-    CMD_GET, CMD_SET, CMD_STATS, ENCODING, ERR_UNKNOWN, ERR_VALUE,
+    CMD_GET, CMD_REPL, CMD_SET, CMD_STATS, CMD_SYNC, ENCODING, ERR_UNKNOWN, ERR_VALUE,
     RESP_NOT_FOUND, RESP_OK,
-    LineTooLongError, encode_line, format_stats, format_value,
+    LineTooLongError, encode_line, format_not_primary, format_stats, format_value,
     parse_line, read_line,
 )
 from server.replication import Replicator
 from server.store import Store
-
-# server/sync.py belongs to another branch (level2-sync). Until it is merged the server
-# starts without SYNC; once the file exists the calls below become active automatically.
-# TODO: turn this into a plain import when sync.py is on main.
-try:
-    from server.sync import pull_sync
-except ImportError:
-    pull_sync = None
+from server.sync import pull_sync, serve_sync
 
 log = logging.getLogger("server")
 
@@ -71,13 +69,20 @@ def execute(node, line):
     """Process a single request line and return the response line (without trailing \\n).
 
     Independent of the network, so it can be tested without a socket.
+    SYNC is not handled here: its answer has many lines, see handle_client().
     """
-    req = parse_line(line)
+    return execute_request(node, parse_line(line))
+
+
+def execute_request(node, req):
+    """Process an already parsed request (see execute)."""
     if not req.ok:
         return req.error                 # ERR KEY / ERR VALUE / ERR UNKNOWN
 
     if req.cmd == CMD_SET:
-        # TODO (B2.4): a backup must answer ERR NOT_PRIMARY <port> here (needs protocol.py 1.1)
+        if node.role == ROLE_BACKUP:
+            # Only the primary accepts writes; the client follows this answer to the primary
+            return format_not_primary(node.primary[1])
         err, seq = node.store.set(req.key, req.value)
         if err:
             return err                   # nothing was written, so nothing is replicated
@@ -94,7 +99,15 @@ def execute(node, line):
     if req.cmd == CMD_STATS:
         return format_stats(node.store.count())
 
-    return ERR_UNKNOWN                   # normally unreachable
+    if req.cmd == CMD_REPL:
+        if node.role != ROLE_BACKUP:
+            return ERR_UNKNOWN           # only a backup accepts REPL
+        # Applied only if seq is newer than the stored one; an old or repeated REPL still gets OK
+        err = node.store.apply_replicated(req.key, req.value, req.seq)
+        return err if err else RESP_OK   # ERR FULL makes the primary mark this backup behind
+
+    # SYNC reaches this point only on a server that is not the primary (see handle_client)
+    return ERR_UNKNOWN
 
 
 def handle_client(conn, addr, node):
@@ -119,8 +132,15 @@ def handle_client(conn, addr, node):
             if line is None:             # client closed the connection
                 break
 
+            req = parse_line(line)
+            if req.ok and req.cmd == CMD_SYNC and node.role == ROLE_PRIMARY:
+                # Multi-line answer (ENTRY ... END), written to the socket by serve_sync.
+                # addr[0] is the backup's host; the port is the one it LISTENS on (from the request).
+                serve_sync(conn, node.store, node.replicator, addr[0], req.port)
+                continue
+
             try:
-                response = execute(node, line)
+                response = execute_request(node, req)
             except Exception:            # an unexpected error must not bring the server down
                 log.exception("istek islenirken hata")
                 response = ERR_UNKNOWN
@@ -142,9 +162,6 @@ def sync_from_primary(node, my_port):
     backup alive at the start of the SYNC and may send REPL immediately. If the backup
     were not listening yet, the primary would time out and mark it behind again.
     """
-    if pull_sync is None:
-        log.warning("server/sync.py is not available yet: starting without SYNC")
-        return
     host, port = node.primary
     try:
         count = pull_sync(host, port, my_port, node.store)

@@ -9,21 +9,33 @@ import threading
 import unittest
 
 from client.client import KVClient
-from common.protocol import ERR_FULL, ERR_KEY, ERR_UNKNOWN, MAX_KEYS
-from server.server import ROLE_PRIMARY, Node, execute, parse_addr, parse_peers, serve
+from common.protocol import (
+    ERR_FULL, ERR_KEY, ERR_UNKNOWN, MAX_KEYS, RESP_END, encode_line, format_sync, parse_entry,
+)
+from server.server import (
+    ROLE_BACKUP, ROLE_PRIMARY, Node, execute, handle_client, parse_addr, parse_peers, serve,
+)
 from server.store import Store
 
 HOST = "127.0.0.1"
 
 
 class FakeReplicator:
-    """Records replicate() calls instead of sending anything."""
+    """Records replicate() and mark_alive() calls instead of sending anything."""
 
-    def __init__(self):
+    def __init__(self, peers=()):
         self.calls = []
+        self.alive_calls = []
+        self._peers = list(peers)
 
     def replicate(self, seq, key, value):
         self.calls.append((seq, key, value))
+
+    def mark_alive(self, host, port):
+        self.alive_calls.append((host, port))
+
+    def status(self):
+        return {addr: "alive" for addr in self._peers}
 
 
 def free_port():
@@ -106,6 +118,79 @@ class TestExecutePrimary(unittest.TestCase):
         execute(self.node, "GET k1")
         execute(self.node, "STATS")
         self.assertEqual(self.rep.calls, [])
+
+
+class TestExecuteBackup(unittest.TestCase):
+    def setUp(self):
+        self.node = Node(Store(), role=ROLE_BACKUP, primary=(HOST, 5000))
+
+    def test_client_set_reddedilir(self):
+        self.assertEqual(execute(self.node, "SET k1 v"), "ERR NOT_PRIMARY 5000")
+        self.assertEqual(execute(self.node, "STATS"), "STATS 0")     # nothing was written
+
+    def test_repl_uygulanir(self):
+        self.assertEqual(execute(self.node, "REPL 7 k1 merhaba dünya"), "OK")
+        self.assertEqual(execute(self.node, "GET k1"), "VALUE merhaba dünya")   # reads work on a backup
+        self.assertEqual(self.node.store.snapshot(), [(7, "k1", "merhaba dünya")])
+
+    def test_eski_repl_ok_ama_yazilmaz(self):
+        execute(self.node, "REPL 8 k1 sekiz")
+        self.assertEqual(execute(self.node, "REPL 7 k1 yedi"), "OK")  # old seq: ignored, still OK
+        self.assertEqual(execute(self.node, "GET k1"), "VALUE sekiz")
+
+    def test_dolu_backup_err_full(self):
+        for i in range(MAX_KEYS):
+            execute(self.node, f"REPL {i + 1} k{i} v")
+        self.assertEqual(execute(self.node, "REPL 999 yeni v"), ERR_FULL)
+
+    def test_bozuk_repl(self):
+        self.assertEqual(execute(self.node, "REPL abc k1 v"), ERR_UNKNOWN)   # checked by parse_line
+        self.assertEqual(execute(self.node, "REPL 7"), ERR_KEY)
+
+    def test_sync_backupta_reddedilir(self):
+        self.assertEqual(execute(self.node, "SYNC 5001"), ERR_UNKNOWN)
+
+
+class TestYanlisRol(unittest.TestCase):
+    """REPL is only for backups, SYNC only for the primary."""
+
+    def test_rolsuz_sunucu(self):
+        node = Node(Store())
+        self.assertEqual(execute(node, "REPL 1 k1 v"), ERR_UNKNOWN)
+        self.assertEqual(execute(node, "SYNC 5001"), ERR_UNKNOWN)
+        self.assertEqual(execute(node, "STATS"), "STATS 0")
+
+    def test_primary_repl_kabul_etmez(self):
+        node = Node(Store(), role=ROLE_PRIMARY, replicator=FakeReplicator())
+        self.assertEqual(execute(node, "REPL 1 k1 v"), ERR_UNKNOWN)
+        self.assertEqual(execute(node, "STATS"), "STATS 0")
+
+
+class TestSyncPrimary(unittest.TestCase):
+    """handle_client sends SYNC to serve_sync on a primary (multi-line answer)."""
+
+    def test_sync_tum_depoyu_gonderir_ve_mark_alive_cagirir(self):
+        rep = FakeReplicator(peers=[(HOST, 5001)])
+        node = Node(Store(), role=ROLE_PRIMARY, replicator=rep)
+        execute(node, "SET k1 merhaba dünya")
+        execute(node, "SET k2 x")
+
+        server_side, client_side = socket.socketpair()
+        t = threading.Thread(target=handle_client, args=(server_side, (HOST, 40000), node), daemon=True)
+        t.start()
+        self.addCleanup(client_side.close)
+
+        client_side.sendall(encode_line(format_sync(5001)) + encode_line("STATS"))
+        reader = client_side.makefile("r", encoding="utf-8", newline="\n")
+        lines = []
+        while True:
+            line = reader.readline().rstrip("\n")
+            lines.append(line)
+            if line == RESP_END:
+                break
+        self.assertEqual([parse_entry(l) for l in lines[:-1]], [(1, "k1", "merhaba dünya"), (2, "k2", "x")])
+        self.assertEqual(rep.alive_calls, [(HOST, 5001)])        # host from the connection, port from SYNC
+        self.assertEqual(reader.readline().rstrip("\n"), "STATS 2")   # the connection stays usable
 
 
 class TestServe(unittest.TestCase):
