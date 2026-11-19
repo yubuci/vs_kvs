@@ -4,7 +4,7 @@
 > Paralel çalışmanın tek şartı bu belgedir: client'ı yazan ile sunucuyu yazan kişi birbirini beklemeden, yalnızca buna bakarak çalışabilmelidir.
 > Değişiklikler yalnızca Pull Request ile ve üç kişinin onayıyla yapılır. Her değişiklik en alttaki **Değişiklik geçmişi** bölümüne yazılır.
 
-**Sürüm:** 1.0 (13.11.2026)
+**Sürüm:** 1.1 (18.11.2026)
 
 ---
 
@@ -118,6 +118,20 @@ kvs> exit
 - Bağlantı ve okuma için timeout 3 saniyedir.
 - Sunucuya ulaşılamazsa client traceback değil, anlaşılır bir hata mesajı yazar ve 0'dan farklı bir çıkış koduyla biter.
 
+### Küme modu (Seviye 2)
+
+```
+python -m client.client --servers servers.json SET k1 merhaba
+python -m client.client --servers servers.json GET k1
+```
+
+- `--servers` ve `--port` birlikte kullanılamaz; ikisinden tam biri gerekir. `--port` ile Level 1 davranışı aynen sürer.
+- `SET` primary'ye gider. `GET`, `STATS` ve diğer komutlar listedeki ilk **ulaşılabilir** sunucuya gider (liste sırasıyla denenir).
+- Cevap `ERR NOT_PRIMARY <port>` ise client, cevabı veren sunucuyla aynı host'taki o porta bağlanıp komutu **bir kez** tekrarlar. İkinci cevap yine `ERR NOT_PRIMARY` ise olduğu gibi döndürülür (döngü yok).
+- Primary'ye ulaşılamazsa `SET` başarısız olur (çıkış kodu 2); yeni primary seçilmez (Level 5). `GET` backup'tan okunmaya devam eder.
+- `servers.json` hatalıysa (dosya yok, bozuk JSON, primary yok ya da iki tane...) client traceback değil, anlaşılır bir hata yazar ve 2 ile çıkar.
+- Zaman aşımında (sunucu bağlıyken cevap vermezse) yeniden deneme yapılmaz; kopan bağlantıda bir kez yeniden bağlanılır.
+
 ---
 
 ## 4. Hata kodları (tam liste)
@@ -149,9 +163,34 @@ kvs> exit
 | Mesaj | Cevap | Açıklama | Seviye |
 |---|---|---|---|
 | `REPL <seq> <key> <value>` | `OK` / `ERR FULL` | Primary'den backup'a kopyalama. Bu mesajda satır 4 parçaya bölünür: `split(" ", 3)`. | 2 |
-| `SYNC` | `ENTRY <seq> <key> <value>` satırları, ardından `END` | Yeniden başlayan backup tüm depoyu çeker. | 2 |
+| `SYNC <port>` | `ENTRY <seq> <key> <value>` satırları, ardından `END` | Yeniden başlayan backup tüm depoyu çeker. `<port>`: isteği gönderen backup'ın dinlediği port; primary bu backup'ı yeniden "canlı" sayar (sürüm 1.1: sürüm 1.0'da `SYNC` argümansızdı). | 2 |
 | `PING` | `PONG` | Heartbeat (500 ms'de bir) | 5 |
 | `VOTE <term> <aday_port>` | `GRANT` / `DENY` | Raft-lite leader seçimi | 5 |
+
+### 5.2.1 Sayı alanları, kontrol sırası ve satır uzunluğu (sürüm 1.1)
+
+| Alan | Kural | İhlal edilirse |
+|---|---|---|
+| `seq` | Yalnızca ASCII rakamlar, değer ≥ 1. İşaret (`+7`, `-1`), boşluk, alt çizgi (`1_000`), ondalık (`7.0`) ve ASCII olmayan rakamlar (`٧`) geçersizdir. Baştaki sıfırlar kabul edilir (`007` = 7). | `ERR UNKNOWN` |
+| `port` | `seq` ile aynı kural; ek olarak değer ≤ 65535. | `ERR UNKNOWN` |
+
+> Neden bu kadar katı? Python'da `int("+7")`, `int("1_000")` ve `int("٧")` sorunsuz çalışır; `"٧".isdigit()` de `True` döner. Ağdan gelen bir mesajın tek bir geçerli yazılışı olmalı.
+
+**`REPL` kontrol sırası:** komut → `seq` → `key` → `value`. Eksik alanlar:
+
+| İstek | Cevap |
+|---|---|
+| `REPL` | `ERR UNKNOWN` (seq yok) |
+| `REPL 7` | `ERR KEY` |
+| `REPL 7 k1` | `ERR VALUE` |
+
+**`SYNC`:** tam olarak `SYNC <port>`. Argümansız `SYNC`, fazla argüman ve sondaki boşluk `ERR UNKNOWN` döner (sürüm 1.0'dan kasıtlı kırılma).
+
+**`ENTRY` satırı:** `split(" ", 3)` ile ayrıştırılır; `key` ve `value` yine doğrulanır (bozuk bir primary backup'ın deposuna geçersiz kayıt yazamasın). `END` ve bozuk satır `parse_entry` için aynı sonucu (`None`) verir; bu yüzden alıcı önce `END` kontrolünü yapar.
+
+**Satır uzunluğu:** en uzun `REPL` satırı = 5 (`REPL `) + 19 (seq ≤ 2⁶³−1) + 1 + 16 + 1 + 4080 = **4122**; `ENTRY` satırı **4123**. İkisi de 4200 sınırının altındadır (test: `TestLineLength`).
+
+**Cevap `ERR NOT_PRIMARY <port>`:** backup'a gelen client `SET`'ine verilir; `<port>` primary'nin portudur (1–65535).
 
 ### 5.3 Replikasyon kuralı (Seviye 2)
 
@@ -188,3 +227,4 @@ kvs> exit
 | Tarih | Sürüm | Değişiklik | Kim |
 |---|---|---|---|
 | 13.11.2026 | 1.0 | İlk sürüm | |
+| 18.11.2026 | 1.1 | `SYNC <port>` (argümansız `SYNC` artık geçersiz); `REPL`/`ENTRY`/`END` ayrıştırma kuralları; `seq` ve `port` yalnızca ASCII rakam, ≥ 1, `port` ≤ 65535; `REPL` kontrol sırası (komut, seq, key, value); satır uzunluğu hesabı (4122/4123); `ERR NOT_PRIMARY <port>` biçimi; client `--servers` yönlendirme kuralları | Öğrenci2 |
