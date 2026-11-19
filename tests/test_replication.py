@@ -174,6 +174,20 @@ class TestReplicator(unittest.TestCase):
         self.assertEqual(b.received(), ["REPL 1 k1 v", "REPL 3 k3 v"])
         self.assertEqual(r.status(), {b.addr: "alive"})
 
+    def test_eski_basarisizlik_yeni_mark_alive_i_ezmez(self):
+        # Regression (found by tests/test_cluster.py on Windows, 2026-11-20):
+        # a REPL is stuck on a dead backup; meanwhile the backup restarts and its SYNC
+        # calls mark_alive(); then the old REPL times out. The stale failure must NOT
+        # set the backup back to "behind", otherwise it never receives REPL again.
+        b = self.backup(response=None)                 # never answers: REPL waits for the 1 s timeout
+        r = self.replicator([b.addr])
+        t = threading.Thread(target=r.replicate, args=(1, "k1", "v"))
+        t.start()
+        time.sleep(0.3)                                # REPL is now in flight
+        r.mark_alive(HOST, b.port)                     # backup restarted and began a SYNC
+        t.join()                                       # the old REPL fails with a timeout
+        self.assertEqual(r.status(), {b.addr: "alive"})
+
     def test_mark_alive_bilinmeyen_adres_yok_sayilir(self):
         b = self.backup()
         r = self.replicator([b.addr])

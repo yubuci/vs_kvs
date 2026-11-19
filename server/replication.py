@@ -30,6 +30,10 @@ class Replicator:
                 "client": KVClient(host, port, timeout=TIMEOUT),   # connects lazily, on the first send
                 "lock": threading.Lock(),                          # one request/response at a time per backup
                 "status": "alive",
+                # Generation: incremented by every mark_alive(). A failed REPL may only mark
+                # the backup behind if no mark_alive() happened since the REPL started;
+                # otherwise a stale failure would overwrite the newer "alive" (see _mark_behind).
+                "generation": 0,
             }
 
     def status(self):
@@ -51,6 +55,7 @@ class Replicator:
             # Read the status under the status lock, then release it before any network I/O
             with self._status_lock:
                 alive = peer["status"] == "alive"
+                generation = peer["generation"]
             if not alive:
                 continue                            # behind: skip, do not even try
 
@@ -60,18 +65,18 @@ class Replicator:
                 except KVError as e:
                     # Unreachable or no answer within the timeout
                     log.warning("backup %s:%s unreachable (%s): marked behind", addr[0], addr[1], e)
-                    self._mark_behind(addr)
+                    self._mark_behind(addr, generation)
                     continue
                 except Exception:
                     # replicate() must never raise: a backup problem must not break the client's SET
                     log.exception("unexpected error while replicating to %s:%s", addr[0], addr[1])
-                    self._mark_behind(addr)
+                    self._mark_behind(addr, generation)
                     continue
 
             if response != RESP_OK:
                 # The backup answered but did not apply the write (e.g. ERR FULL): it has diverged
                 log.warning("backup %s:%s answered %r to REPL: marked behind", addr[0], addr[1], response)
-                self._mark_behind(addr)
+                self._mark_behind(addr, generation)
 
     def mark_alive(self, host, port):
         """Make a backup "alive" again so it receives REPL (called when it starts a SYNC)."""
@@ -80,6 +85,7 @@ class Replicator:
             if addr not in self._peers:
                 return                      # unknown backup: ignore instead of crashing
             self._peers[addr]["status"] = "alive"
+            self._peers[addr]["generation"] += 1
 
     def close(self):
         """Close the connections to all backups (server shutdown, end of a test)."""
@@ -87,7 +93,17 @@ class Replicator:
             with peer["lock"]:              # wait for a REPL that is still in flight
                 peer["client"].close()
 
-    def _mark_behind(self, addr):
-        """Set a backup to "behind"; it gets no more REPL until mark_alive() is called."""
+    def _mark_behind(self, addr, generation):
+        """Set a backup to "behind"; it gets no more REPL until mark_alive() is called.
+
+        generation is the value read when the failed REPL started. If mark_alive() was
+        called in the meantime (the backup restarted and began a SYNC), the failure is
+        stale and is ignored: the write it carried is already in the SYNC snapshot,
+        because the snapshot is taken after mark_alive().
+        """
         with self._status_lock:
-            self._peers[addr]["status"] = "behind"
+            peer = self._peers[addr]
+            if peer["generation"] != generation:
+                log.info("backup %s:%s: stale failure ignored (SYNC started meanwhile)", addr[0], addr[1])
+                return
+            peer["status"] = "behind"
