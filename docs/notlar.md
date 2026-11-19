@@ -125,3 +125,33 @@
 - **Tekrar üretme:** Cevap vermeyen sahte backup ile deterministik test (`test_eski_basarisizlik_yeni_mark_alive_i_ezmez`): REPL asılıyken `mark_alive` çağrılıyor, REPL timeout'la bitince durum `behind` (beklenen `alive`). Linux'ta da her seferinde başarısız.
 - **Düzeltme önerisi (Öğrenci1'in onayıyla):** Her backup için bir nesil sayacı (`generation`). `mark_alive` sayacı artırır; REPL başlarken o anki nesli okur; başarısız olursa backup'ı yalnızca nesil değişmemişse "behind" yapar. Arada `mark_alive` olduysa başarısızlık yok sayılır. Güvenli, çünkü o REPL'in taşıdığı yazma `mark_alive`'dan sonra alınan SYNC snapshot'ında zaten var.
 - **Ders:** Durum değiştiren eşzamanlı işlemlerde "son yazan kazanır" yetmez; eski bir sonucun yeni bir kararın üzerine yazmaması için sürüm/nesil bilgisi gerekir (seq ile aynı fikir, bu kez Replicator'ın durum tablosunda). Ayrıca: yarış, yalnızca zamanlaması farklı bir platformda (Windows) ortaya çıktı.
+- **Rapor için (Fragestellung, 2.3, 5, 6):** Bu hata araştırma sorusunun "bir düğüm çökünce veri erişilebilir kalıyor mu?" kısmına doğrudan cevap veriyor. (1) Replikasyon tek başına yetmez; asıl zor kısım düğümün **geri dönüşü**: backup çöktüğünde veri kaybolmadı, ama geri katılırken eski bir mesaj yeni durumu bozdu ve backup **sessizce** geride kaldı (hata mesajı yok, yalnızca entegrasyon testi fark etti). (2) Çözüm, dağıtık sistemlerin temel bir fikrinin küçük bir örneği: bayat mesajları sürüm numarasıyla tanımak. Projede iki kez kullanıldı: veri için `seq` (eski değer yeni değeri ezmesin), düğüm durumu için `generation` (eski başarısızlık yeni "alive" kararını ezmesin). Raft'taki **term** numarası aynı amaçla var: düşük term'li mesaj reddedilir (Ongaro & Ousterhout 2014); bu, Level 2'yi Level 5'e ve literatüre bağlar. (3) Hata yalnızca Windows'ta göründü: dağıtık sistemlerdeki hatalar zamanlamaya bağlıdır, test ortamı ile gerçek ortamın zamanlaması farklıysa gizli kalabilir. Ayrıca test yazımı dersi (bir önceki madde grubu): bir testin geçmesi, hatayı yakalayabildiğini göstermez.
+
+
+## 2026-11-20 (Öğrenci3, Level 2 Aşama C: gecikme ölçümü)
+
+- **Yöntem:** `tests/measure_latency.py`. Üç düzen, her biri yeni bir kümede: 1 kopya (tek rolsüz sunucu), 2 kopya (primary + 1 backup), 3 kopya (primary + 2 backup). Tek client, tek bağlantı; 1.000 SET sırayla, ilk 50'si ısınma (sayılmıyor). Her düzen 3 kez ayrı kümede ölçüldü, tabloda üç ölçümün medyanı. Key'ler 200'lük havuzda dönüyor (256 sınırı).
+- **Sistem:** Windows 11, Python 3.13.15, AMD64; sunucular ve client aynı makinede (loopback).
+
+**Value 100 karakter** (iki ayrı çalıştırma, medyan ms):
+
+| Kopya | Çalıştırma 1 | Çalıştırma 2 | Oran (1 kopyaya göre) |
+|---|---|---|---|
+| 1 | 0,030 | 0,028 | 1,00× |
+| 2 | 0,063 | 0,060 | 2,06× / 2,14× |
+| 3 | 0,090 | 0,098 | 2,95× / 3,51× |
+
+**Value 4.080 karakter** (en büyük değer):
+
+| Kopya | Ortalama (ms) | Medyan (ms) | p95 (ms) | Min (ms) | Max (ms) | Oran |
+|---|---|---|---|---|---|---|
+| 1 | 0,040 | 0,032 | 0,064 | 0,028 | 0,130 | 1,00× |
+| 2 | 0,069 | 0,064 | 0,094 | 0,060 | 0,324 | 1,99× |
+| 3 | 0,110 | 0,103 | 0,158 | 0,094 | 0,391 | 3,21× |
+
+- **Gözlem:** Gecikme kopya sayısıyla yaklaşık doğrusal artıyor; her backup ~0,03 ms, yani yaklaşık bir istek-cevap süresi ekliyor. En küçük değerlerde de aynı: 1 kopya ~0,025 ms, 3 kopya ~0,085 ms.
+- **Açıklama:** `Replicator` REPL'leri backup'lara **sırayla** gönderiyor (birinin cevabını bekleyip sonra diğerine). Replikasyon senkron olduğu için primary OK'yi ancak hepsi bitince dönüyor; süreler toplanıyor.
+- **Gözlem:** 4.080 karakterlik value, 100 karakterliğe göre neredeyse aynı süre veriyor. Loopback'te süreyi veri miktarı değil, mesaj başına sabit maliyet (sistem çağrıları, thread uyanması, Python) belirliyor.
+- **Gözlem:** Aynı ölçüm iki kez yapılınca 3 kopyadaki oran 2,95× ile 3,51× arasında değişti. Mikrosaniye düzeyinde işletim sistemi zamanlaması sonucu etkiliyor; tek ölçüme güvenilmemeli, tekrar ve medyan kullanılmalı. Ortalama, ara sıra yavaşlayan tek istekler (max sütunu) yüzünden medyandan yüksek.
+- **Sınır (rapor için):** Ölçüm tek makinede, loopback üzerinden. Gerçek bir ağda bir istek-cevap süresi ~0,1–1 ms ve üzeri olur; mutlak değerler büyür ama yapı aynı kalır: her senkron kopya bir gidiş-dönüş ekler.
+- **İyileştirme fikri (Ausblick):** REPL'ler backup'lara paralel gönderilirse 3 kopyadaki gecikme yaklaşık 2 kopya düzeyine iner (en yavaş backup belirler). Bedeli: daha karmaşık kod (thread havuzu ya da asenkron G/Ç) ve hata durumlarının yönetimi.
