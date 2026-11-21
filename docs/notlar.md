@@ -125,3 +125,51 @@
 - **Tekrar üretme:** Cevap vermeyen sahte backup ile deterministik test (`test_eski_basarisizlik_yeni_mark_alive_i_ezmez`): REPL asılıyken `mark_alive` çağrılıyor, REPL timeout'la bitince durum `behind` (beklenen `alive`). Linux'ta da her seferinde başarısız.
 - **Düzeltme önerisi (Öğrenci1'in onayıyla):** Her backup için bir nesil sayacı (`generation`). `mark_alive` sayacı artırır; REPL başlarken o anki nesli okur; başarısız olursa backup'ı yalnızca nesil değişmemişse "behind" yapar. Arada `mark_alive` olduysa başarısızlık yok sayılır. Güvenli, çünkü o REPL'in taşıdığı yazma `mark_alive`'dan sonra alınan SYNC snapshot'ında zaten var.
 - **Ders:** Durum değiştiren eşzamanlı işlemlerde "son yazan kazanır" yetmez; eski bir sonucun yeni bir kararın üzerine yazmaması için sürüm/nesil bilgisi gerekir (seq ile aynı fikir, bu kez Replicator'ın durum tablosunda). Ayrıca: yarış, yalnızca zamanlaması farklı bir platformda (Windows) ortaya çıktı.
+
+
+
+
+## 2026-11-21 (Öğrenci1, Level 3: ring.py ve sunucuda sahiplik kontrolü)
+
+### ring.py
+
+- **Karar:** Yerleştirme kuralı yalnızca `common/ring.py`'de; client, sunucu ve ölçüm betikleri `make_placement()` üzerinden kullanıyor. Kural iki yerde yazılsaydı küçük bir fark, client'ın key'i bir sunucuya, sunucunun ise başka bir sunucuya ait saymasına yol açardı.
+- **Karar:** `stable_hash` = md5 özetinin ilk 8 baytı, big-endian, işaretsiz 64-bit. Python'un `hash()`'i kullanılmadı: metinlerin hash'i her süreçte rastgele bir tuzla hesaplanıyor (`PYTHONHASHSEED`), yani client ve sunucu aynı key için farklı sayı bulurdu. 64 bit, sanal noktaların çakışmasını pratikte imkânsız kılıyor. Testte dört sabit değer var, biri Türkçe karakterli (`"şehir"`): UTF-8 kullanıldığını kanıtlıyor.
+- **Karar:** Düğüm kimliği her yerde `node_id(host, port)` = `"127.0.0.1:5000"`. `localhost` ile `127.0.0.1` metin olarak farklı ve iki ayrı düğüm sayılıyor; bunu bilerek bir testle belgeledik (Level 2'deki `mark_alive` tuzağının aynısı).
+- **Karar:** Varsayılan 50 sanal düğüm. Tek noktayla dağılım çok dengesiz (10.000 key, 3 sunucu: 4.808 / 863 / 4.329); 50 noktayla 3.573 / 3.279 / 3.148.
+- **Karar:** Arama `bisect_right` ile: key'in hash'i bir noktanın konumuna tam eşitse bir SONRAKİ noktaya gidiyor. İki seçenek de doğru olurdu; önemli olan herkesin aynısını kullanması. Öğrenci3'e bildirildi; `test_noktaya_esit_hash_sonrakine_gider` bu kararı sabitliyor.
+- **Karar:** Noktalar `(konum, sunucu)` çifti olarak sıralanıp iki paralel listeye (`_hashes`, `_owners`) ayrılıyor; `bisect` yalnızca sayı listesinde arama yapabiliyor. Sıralama sayesinde sunucu listesinin sırası sonucu değiştirmiyor (ring'de sıra önemsiz, `mod N`'de önemli; ikisi de test edildi).
+- **Karar:** Listede aynı sunucu iki kez varsa `ValueError`. Sözleşmede yoktu; eklenmezse `nodes_for` hiç bulamayacağı kadar farklı sunucu arayıp sonsuz döngüye girerdi.
+- **Karar:** `nodes_for(key, n)` Level 3'te kullanılmıyor ama şimdiden yazıldı: Level 4'te key'in kopyalarının gideceği sunucular.
+- **Ölçüm (10.000 key, 3 → 4 sunucu; hash deterministik olduğu için platformdan bağımsız):** `mod N` ile key'lerin %75,2'si yer değiştirdi; ring ile (50 vnode) %20,7 ve taşınan key'lerin HEPSİ yeni sunucuya gitti, eski sunucular arasında hiç değiş tokuş olmadı. Bu, consistent hashing'in tanımlayıcı özelliği; `test_dugum_eklenince_tasinan_key_yeni_dugume_gider` bunu sınıyor.
+- **Mutasyon denemesi:** `ring.py` bilerek 7 şekilde bozuldu, her seferinde en az bir test kırıldı:
+
+| Bozulma | Kırılan test |
+|---|---|
+| `bisect` sonucu bir kaydırıldı | 5 |
+| `bisect_right` yerine `bisect_left` | 1 |
+| Sardırma (sondan başa dönüş) kaldırıldı | 2 |
+| md5 yerine Python `hash()` | 1 |
+| big-endian yerine little-endian | 1 |
+| `nodes_for` aynı sunucuyu iki kez alabiliyor | 2 |
+| Nokta adı `"node#i"` yerine `"nodei"` | 1 |
+
+- **Ders:** `test_referans_ile_ayni`, `node_for`'u en basit yoldan (listeyi baştan sona tarayarak) hesaplayan ikinci bir yöntemle karşılaştırıyor. `bisect` kaydırma hatasını yakalayan asıl test bu; tek tek elle seçilmiş örnekler bu tür bir hatayı kolayca kaçırırdı.
+
+### server.py (--cluster)
+
+- **Karar:** Sunucu da her `SET`/`GET`'te sahibi hesaplıyor; ait değilse `ERR WRONG_NODE <port>` döndürüyor ve yazmıyor. Neden: yerleştirmeye client karar veriyor, ama yanlış yapılandırılmış bir client aynı key'i iki sunucuya yazabilirdi. Sunucunun kontrolü "her key yalnızca sahibinde" kuralını client hatasına karşı koruyor (Redis Cluster'daki `MOVED` yönlendirmesine benzer).
+- **Karar:** Kontrol `execute_request`'te, ayrıştırmadan SONRA: biçim hatası olan bir satır (`ERR KEY`, `ERR VALUE`) sahipliğe bakılmadan reddediliyor. `STATS` kontrol edilmiyor; her sunucu kendi sayısını veriyor, toplamı client hesaplıyor.
+- **Karar:** Ring açılışta bir kez kuruluyor (`make_placement`), her istekte değil.
+- **Karar:** Sunucu kendi kimliği listede yoksa açılmıyor: öyle bir sunucu hiçbir key'in sahibi olamaz ve her isteği reddederdi; hatayı açılışta göstermek, çalışırken anlamsız `WRONG_NODE` cevapları vermekten iyi.
+- **Karar:** `--cluster` ile `--role` birlikte verilemiyor (sharding + replikasyon Level 4); `--placement`/`--vnodes` yalnızca `--cluster` ile geçerli. Hatalı kombinasyon, sunucu soket açmadan çıkış kodu 2 ile reddediliyor.
+- **Karar:** Küme ayarlarını kuran kısım ayrı bir fonksiyon (`cluster_settings`); böylece sunucu başlatmadan test edilebiliyor.
+- **Karar (geçici):** `format_wrong_node` ve `load_shard_config` henüz yok (Öğrenci2). Beklememek için `server.py`'nin başına, sözleşmeye (bölüm 3.2–3.3) uyan geçici yedekler kondu (`TODO(Level 3)` bloğu, `try/except ImportError`). Gerçek fonksiyonlar gelince yedekler kendiliğinden devre dışı kalıyor; final PR'dan önce silinecek. Level 2'de `sync.py` için de aynı yöntem kullanılmıştı; Öğrenci2'nin dosyalarına dokunulmadığı için çakışma yok.
+- **Gözlem (gerçek 3 sunucu, 600 key):** Sahibi olmayan sunucuya giden 1.200 `GET`'in hepsi `ERR WRONG_NODE` aldı; her key yalnızca sahibinde.
+- **Gözlem (port seçimi dağılımı değiştiriyor):** Aynı 600 key, portlar 5000–5002 iken 191 / 202 / 207 dağılıyor; portlar 5400–5402 iken 153 / 168 / 279 ve bir sunucu 256'da dolup 23 key `ERR FULL` alıyor. Sanal noktaların konumu sunucu kimliğinin hash'ine bağlı, yani aynı vnode sayısıyla bile dağılım hangi sunucuların seçildiğine göre değişiyor. "768 kayıt yalnızca teorik üst sınır" iddiasının somut örneği (rapor bölüm 5 ve 2.4).
+- **Test:** Windows'ta 215 test geçti (76 sn); Level 1 ve Level 2 testleri değişmeden geçiyor.
+
+### Açık
+
+- Öğrenci2'nin `protocol.py` 1.2 ve `config.py` değişiklikleri gelince geçici yedekler silinecek.
+- `ShardedClient` ve `start_cluster` sharding modu gelince gerçek kümede 600 key denemesi.
