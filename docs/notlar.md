@@ -125,33 +125,116 @@
 - **Tekrar üretme:** Cevap vermeyen sahte backup ile deterministik test (`test_eski_basarisizlik_yeni_mark_alive_i_ezmez`): REPL asılıyken `mark_alive` çağrılıyor, REPL timeout'la bitince durum `behind` (beklenen `alive`). Linux'ta da her seferinde başarısız.
 - **Düzeltme önerisi (Öğrenci1'in onayıyla):** Her backup için bir nesil sayacı (`generation`). `mark_alive` sayacı artırır; REPL başlarken o anki nesli okur; başarısız olursa backup'ı yalnızca nesil değişmemişse "behind" yapar. Arada `mark_alive` olduysa başarısızlık yok sayılır. Güvenli, çünkü o REPL'in taşıdığı yazma `mark_alive`'dan sonra alınan SYNC snapshot'ında zaten var.
 - **Ders:** Durum değiştiren eşzamanlı işlemlerde "son yazan kazanır" yetmez; eski bir sonucun yeni bir kararın üzerine yazmaması için sürüm/nesil bilgisi gerekir (seq ile aynı fikir, bu kez Replicator'ın durum tablosunda). Ayrıca: yarış, yalnızca zamanlaması farklı bir platformda (Windows) ortaya çıktı.
-- **Rapor için (Fragestellung, 2.3, 5, 6):** Bu hata araştırma sorusunun "bir düğüm çökünce veri erişilebilir kalıyor mu?" kısmına doğrudan cevap veriyor. (1) Replikasyon tek başına yetmez; asıl zor kısım düğümün **geri dönüşü**: backup çöktüğünde veri kaybolmadı, ama geri katılırken eski bir mesaj yeni durumu bozdu ve backup **sessizce** geride kaldı (hata mesajı yok, yalnızca entegrasyon testi fark etti). (2) Çözüm, dağıtık sistemlerin temel bir fikrinin küçük bir örneği: bayat mesajları sürüm numarasıyla tanımak. Projede iki kez kullanıldı: veri için `seq` (eski değer yeni değeri ezmesin), düğüm durumu için `generation` (eski başarısızlık yeni "alive" kararını ezmesin). Raft'taki **term** numarası aynı amaçla var: düşük term'li mesaj reddedilir (Ongaro & Ousterhout 2014); bu, Level 2'yi Level 5'e ve literatüre bağlar. (3) Hata yalnızca Windows'ta göründü: dağıtık sistemlerdeki hatalar zamanlamaya bağlıdır, test ortamı ile gerçek ortamın zamanlaması farklıysa gizli kalabilir. Ayrıca test yazımı dersi (bir önceki madde grubu): bir testin geçmesi, hatayı yakalayabildiğini göstermez.
 
 
-## 2026-11-20 (Öğrenci3, Level 2 Aşama C: gecikme ölçümü)
 
-- **Yöntem:** `tests/measure_latency.py`. Üç düzen, her biri yeni bir kümede: 1 kopya (tek rolsüz sunucu), 2 kopya (primary + 1 backup), 3 kopya (primary + 2 backup). Tek client, tek bağlantı; 1.000 SET sırayla, ilk 50'si ısınma (sayılmıyor). Her düzen 3 kez ayrı kümede ölçüldü, tabloda üç ölçümün medyanı. Key'ler 200'lük havuzda dönüyor (256 sınırı).
-- **Sistem:** Windows 11, Python 3.13.15, AMD64; sunucular ve client aynı makinede (loopback).
 
-**Value 100 karakter** (iki ayrı çalıştırma, medyan ms):
+## 2026-11-21 (Öğrenci1, Level 3: ring.py ve sunucuda sahiplik kontrolü)
 
-| Kopya | Çalıştırma 1 | Çalıştırma 2 | Oran (1 kopyaya göre) |
+### ring.py
+
+- **Karar:** Yerleştirme kuralı yalnızca `common/ring.py`'de; client, sunucu ve ölçüm betikleri `make_placement()` üzerinden kullanıyor. Kural iki yerde yazılsaydı küçük bir fark, client'ın key'i bir sunucuya, sunucunun ise başka bir sunucuya ait saymasına yol açardı.
+- **Karar:** `stable_hash` = md5 özetinin ilk 8 baytı, big-endian, işaretsiz 64-bit. Python'un `hash()`'i kullanılmadı: metinlerin hash'i her süreçte rastgele bir tuzla hesaplanıyor (`PYTHONHASHSEED`), yani client ve sunucu aynı key için farklı sayı bulurdu. 64 bit, sanal noktaların çakışmasını pratikte imkânsız kılıyor. Testte dört sabit değer var, biri Türkçe karakterli (`"şehir"`): UTF-8 kullanıldığını kanıtlıyor.
+- **Karar:** Düğüm kimliği her yerde `node_id(host, port)` = `"127.0.0.1:5000"`. `localhost` ile `127.0.0.1` metin olarak farklı ve iki ayrı düğüm sayılıyor; bunu bilerek bir testle belgeledik (Level 2'deki `mark_alive` tuzağının aynısı).
+- **Karar:** Varsayılan 50 sanal düğüm. Tek noktayla dağılım çok dengesiz (10.000 key, 3 sunucu: 4.808 / 863 / 4.329); 50 noktayla 3.573 / 3.279 / 3.148.
+- **Karar:** Arama `bisect_right` ile: key'in hash'i bir noktanın konumuna tam eşitse bir SONRAKİ noktaya gidiyor. İki seçenek de doğru olurdu; önemli olan herkesin aynısını kullanması. Öğrenci3'e bildirildi; `test_noktaya_esit_hash_sonrakine_gider` bu kararı sabitliyor.
+- **Karar:** Noktalar `(konum, sunucu)` çifti olarak sıralanıp iki paralel listeye (`_hashes`, `_owners`) ayrılıyor; `bisect` yalnızca sayı listesinde arama yapabiliyor. Sıralama sayesinde sunucu listesinin sırası sonucu değiştirmiyor (ring'de sıra önemsiz, `mod N`'de önemli; ikisi de test edildi).
+- **Karar:** Listede aynı sunucu iki kez varsa `ValueError`. Sözleşmede yoktu; eklenmezse `nodes_for` hiç bulamayacağı kadar farklı sunucu arayıp sonsuz döngüye girerdi.
+- **Karar:** `nodes_for(key, n)` Level 3'te kullanılmıyor ama şimdiden yazıldı: Level 4'te key'in kopyalarının gideceği sunucular.
+- **Ölçüm (10.000 key, 3 → 4 sunucu; hash deterministik olduğu için platformdan bağımsız):** `mod N` ile key'lerin %75,2'si yer değiştirdi; ring ile (50 vnode) %20,7 ve taşınan key'lerin HEPSİ yeni sunucuya gitti, eski sunucular arasında hiç değiş tokuş olmadı. Bu, consistent hashing'in tanımlayıcı özelliği; `test_dugum_eklenince_tasinan_key_yeni_dugume_gider` bunu sınıyor.
+- **Mutasyon denemesi:** `ring.py` bilerek 7 şekilde bozuldu, her seferinde en az bir test kırıldı:
+
+| Bozulma | Kırılan test |
+|---|---|
+| `bisect` sonucu bir kaydırıldı | 5 |
+| `bisect_right` yerine `bisect_left` | 1 |
+| Sardırma (sondan başa dönüş) kaldırıldı | 2 |
+| md5 yerine Python `hash()` | 1 |
+| big-endian yerine little-endian | 1 |
+| `nodes_for` aynı sunucuyu iki kez alabiliyor | 2 |
+| Nokta adı `"node#i"` yerine `"nodei"` | 1 |
+
+- **Ders:** `test_referans_ile_ayni`, `node_for`'u en basit yoldan (listeyi baştan sona tarayarak) hesaplayan ikinci bir yöntemle karşılaştırıyor. `bisect` kaydırma hatasını yakalayan asıl test bu; tek tek elle seçilmiş örnekler bu tür bir hatayı kolayca kaçırırdı.
+
+### server.py (--cluster)
+
+- **Karar:** Sunucu da her `SET`/`GET`'te sahibi hesaplıyor; ait değilse `ERR WRONG_NODE <port>` döndürüyor ve yazmıyor. Neden: yerleştirmeye client karar veriyor, ama yanlış yapılandırılmış bir client aynı key'i iki sunucuya yazabilirdi. Sunucunun kontrolü "her key yalnızca sahibinde" kuralını client hatasına karşı koruyor (Redis Cluster'daki `MOVED` yönlendirmesine benzer).
+- **Karar:** Kontrol `execute_request`'te, ayrıştırmadan SONRA: biçim hatası olan bir satır (`ERR KEY`, `ERR VALUE`) sahipliğe bakılmadan reddediliyor. `STATS` kontrol edilmiyor; her sunucu kendi sayısını veriyor, toplamı client hesaplıyor.
+- **Karar:** Ring açılışta bir kez kuruluyor (`make_placement`), her istekte değil.
+- **Karar:** Sunucu kendi kimliği listede yoksa açılmıyor: öyle bir sunucu hiçbir key'in sahibi olamaz ve her isteği reddederdi; hatayı açılışta göstermek, çalışırken anlamsız `WRONG_NODE` cevapları vermekten iyi.
+- **Karar:** `--cluster` ile `--role` birlikte verilemiyor (sharding + replikasyon Level 4); `--placement`/`--vnodes` yalnızca `--cluster` ile geçerli. Hatalı kombinasyon, sunucu soket açmadan çıkış kodu 2 ile reddediliyor.
+- **Karar:** Küme ayarlarını kuran kısım ayrı bir fonksiyon (`cluster_settings`); böylece sunucu başlatmadan test edilebiliyor.
+- **Karar (geçici):** `format_wrong_node` ve `load_shard_config` henüz yok (Öğrenci2). Beklememek için `server.py`'nin başına, sözleşmeye (bölüm 3.2–3.3) uyan geçici yedekler kondu (`TODO(Level 3)` bloğu, `try/except ImportError`). Gerçek fonksiyonlar gelince yedekler kendiliğinden devre dışı kalıyor; final PR'dan önce silinecek. Level 2'de `sync.py` için de aynı yöntem kullanılmıştı; Öğrenci2'nin dosyalarına dokunulmadığı için çakışma yok.
+- **Gözlem (gerçek 3 sunucu, 600 key):** Sahibi olmayan sunucuya giden 1.200 `GET`'in hepsi `ERR WRONG_NODE` aldı; her key yalnızca sahibinde.
+- **Gözlem (port seçimi dağılımı değiştiriyor):** Aynı 600 key, portlar 5000–5002 iken 191 / 202 / 207 dağılıyor; portlar 5400–5402 iken 153 / 168 / 279 ve bir sunucu 256'da dolup 23 key `ERR FULL` alıyor. Sanal noktaların konumu sunucu kimliğinin hash'ine bağlı, yani aynı vnode sayısıyla bile dağılım hangi sunucuların seçildiğine göre değişiyor. "768 kayıt yalnızca teorik üst sınır" iddiasının somut örneği (rapor bölüm 5 ve 2.4).
+- **Test:** Windows'ta 215 test geçti (76 sn); Level 1 ve Level 2 testleri değişmeden geçiyor.
+
+### Açık
+
+- Öğrenci2'nin `protocol.py` 1.2 ve `config.py` değişiklikleri gelince geçici yedekler silinecek.
+- `ShardedClient` ve `start_cluster` sharding modu gelince gerçek kümede 600 key denemesi.
+
+
+## 2026-11-25 (Öğrenci3, Level 3: start_cluster, ölçümler, entegrasyon testleri)
+
+### start_cluster.py (sharding modu)
+
+- **Karar:** Mod dosyadan anlaşılıyor: sunucularda `role` alanı yoksa Level 3 (sharding), varsa Level 2. Böylece tek bir komut iki level'ı da açıyor; `--placement` / `--vnodes` yalnızca Level 3 dosyasıyla kabul ediliyor.
+- **Karar:** Yapılandırma dosyasının yolu sunuculara mutlak yol olarak veriliyor; sunucular depo kökünde başladığı için göreli bir yol orada başka bir dosyayı gösterebilirdi.
+- **Karar (geçici):** `load_shard_config` henüz yok (Öğrenci2). Kodu ikinci kez yazmamak için Öğrenci1'in `server.py`'deki geçici yedeği import ediliyor (`TODO(Level 3)`); gerçek fonksiyon gelince kendiliğinden o kullanılıyor.
+- **Karar:** `write_shard_config()` test ve ölçüm betiklerinin geçici yapılandırma dosyası yazması için.
+
+### measure_rebalance.py (sunucusuz)
+
+- **Yöntem:** 10.000 key, düzenler mod N ve ring (vnode 1, 10, 50, 200); 3 -> 4 ve 4 -> 3 sunucu. Ring sonucu sunucu adlarına (dolayısıyla portlara) bağlı olduğu için 5 port kümesiyle tekrarlandı (5000, 5100, ... 5400); tabloda en küçük – en büyük.
+- **Platformdan bağımsızlık:** Windows 11 ve Linux'ta sayılar her hücrede birebir aynı çıktı (md5 deterministik).
+
+| Düzen | Beklenen | 3 -> 4 yer değiştiren | Eski sunucular arasında taşınan |
 |---|---|---|---|
-| 1 | 0,030 | 0,028 | 1,00× |
-| 2 | 0,063 | 0,060 | 2,06× / 2,14× |
-| 3 | 0,090 | 0,098 | 2,95× / 3,51× |
+| mod N | ~%75 | %75,0 | 5.046 |
+| ring, vnode 1 | ~%25 | %19,3 – %51,2 | 0 |
+| ring, vnode 10 | ~%25 | %20,9 – %36,2 | 0 |
+| ring, vnode 50 | ~%25 | %18,3 – %25,9 | 0 |
+| ring, vnode 200 | ~%25 | %24,3 – %26,1 | 0 |
 
-**Value 4.080 karakter** (en büyük değer):
+| Düzen (3 sunucu, ideal 3.333) | En büyük / ideal | Std. sapma (idealin %'si) |
+|---|---|---|
+| mod N | 1,00 | 0,4 |
+| ring, vnode 1 | 1,45 – 2,16 | 42,9 – 83,1 |
+| ring, vnode 10 | 1,14 – 1,36 | 12,5 – 26,8 |
+| ring, vnode 50 | 1,06 – 1,40 | 4,5 – 28,6 |
+| ring, vnode 200 | 1,04 – 1,09 | 2,9 – 6,7 |
 
-| Kopya | Ortalama (ms) | Medyan (ms) | p95 (ms) | Min (ms) | Max (ms) | Oran |
-|---|---|---|---|---|---|---|
-| 1 | 0,040 | 0,032 | 0,064 | 0,028 | 0,130 | 1,00× |
-| 2 | 0,069 | 0,064 | 0,094 | 0,060 | 0,324 | 1,99× |
-| 3 | 0,110 | 0,103 | 0,158 | 0,094 | 0,391 | 3,21× |
+- **Gözlem (araştırma sorusunun cevabı):** mod N'de sunucu eklenince key'lerin dörtte üçü yer değiştiriyor ve bunların çoğu (5.046) yeni sunucuya değil, **eski sunucular arasında** gidip geliyor. Ring'de yer değiştiren key'lerin hepsi yeni sunucuya gidiyor; eski sunucular arasında taşınan key sayısı her düzende ve her port kümesinde **0**. Bu, consistent hashing'in tanımlayıcı özelliği.
+- **Gözlem (değiş tokuş):** mod N en dengeli dağıtımı veriyor (sapma %0,4), ama yeniden dağıtımda en kötüsü. Ring yeniden dağıtımda iyi, ama dengeyi ancak yeterince sanal düğümle sağlıyor.
+- **Gözlem:** Az sanal düğümle ring'in sonucu port kümesine göre çok oynuyor (vnode 1: yer değiştirme %19 ile %51, bir port kümesinde bir sunucuya yalnızca 52 key). vnode 200'de aralık %24–26'ya daralıyor. Raporda tek sayı yerine aralık verilmeli.
+- **Gözlem:** 3 -> 4 ile 4 -> 3 aynı çıkıyor (aynı key'ler ters yönde taşınıyor). mod N'in port kümesinden etkilenmemesi de beklenen: mod N sunucuların adına değil yalnızca sırasına bakıyor.
 
-- **Gözlem:** Gecikme kopya sayısıyla yaklaşık doğrusal artıyor; her backup ~0,03 ms, yani yaklaşık bir istek-cevap süresi ekliyor. En küçük değerlerde de aynı: 1 kopya ~0,025 ms, 3 kopya ~0,085 ms.
-- **Açıklama:** `Replicator` REPL'leri backup'lara **sırayla** gönderiyor (birinin cevabını bekleyip sonra diğerine). Replikasyon senkron olduğu için primary OK'yi ancak hepsi bitince dönüyor; süreler toplanıyor.
-- **Gözlem:** 4.080 karakterlik value, 100 karakterliğe göre neredeyse aynı süre veriyor. Loopback'te süreyi veri miktarı değil, mesaj başına sabit maliyet (sistem çağrıları, thread uyanması, Python) belirliyor.
-- **Gözlem:** Aynı ölçüm iki kez yapılınca 3 kopyadaki oran 2,95× ile 3,51× arasında değişti. Mikrosaniye düzeyinde işletim sistemi zamanlaması sonucu etkiliyor; tek ölçüme güvenilmemeli, tekrar ve medyan kullanılmalı. Ortalama, ara sıra yavaşlayan tek istekler (max sütunu) yüzünden medyandan yüksek.
-- **Sınır (rapor için):** Ölçüm tek makinede, loopback üzerinden. Gerçek bir ağda bir istek-cevap süresi ~0,1–1 ms ve üzeri olur; mutlak değerler büyür ama yapı aynı kalır: her senkron kopya bir gidiş-dönüş ekler.
-- **İyileştirme fikri (Ausblick):** REPL'ler backup'lara paralel gönderilirse 3 kopyadaki gecikme yaklaşık 2 kopya düzeyine iner (en yavaş backup belirler). Bedeli: daha karmaşık kod (thread havuzu ya da asenkron G/Ç) ve hata durumlarının yönetimi.
+### measure_first_full.py (gerçek küme + tahmin)
+
+- **Yöntem:** 3 sunucu (portlar 5000–5002), benzersiz key'ler tek tek sahibine yazılıyor (`make_placement` + `KVClient`; ShardedClient beklenmedi). Her düzen 5 farklı key kümesiyle. Aynı sayılar ring.py ile sunucusuz olarak da **önceden hesaplanıyor**; ölçüm ile tahminin birebir aynı olması bekleniyor.
+- **Sonuç (Windows 11; Linux'ta da aynı):**
+
+| Düzen | İlk ERR FULL (medyan) | Aralık | 600 key'de ERR FULL (medyan) | 600 key sığdı | Tahmin = ölçüm |
+|---|---|---|---|---|---|
+| mod N | 742 | 706 – 761 | 0 | 5/5 | 5/5 |
+| ring, vnode 1 | 539 | 488 – 561 | 33 | 0/5 | 5/5 |
+| ring, vnode 10 | 577 | 532 – 651 | 10 | 1/5 | 5/5 |
+| ring, vnode 50 | 728 | 688 – 748 | 0 | 5/5 | 5/5 |
+| ring, vnode 200 | 722 | 688 – 744 | 0 | 5/5 | 5/5 |
+
+- **Gözlem:** Teorik üst sınır 768, ama ilk ERR FULL en iyi durumda bile ~720–740. key'de geliyor; vnode 1'de ~540. key'de. "3 sunucu = 768 kayıt" yalnızca teorik üst sınır (Fragestellung'daki "Kapazität wächst mit der Knotenzahl" iddiası Fazit'te nitelendirilmeli).
+- **Gözlem:** 600 key demosu vnode 1'de hiç, vnode 10'da 5 denemeden yalnızca birinde sığdı; vnode 50 ve 200'de her zaman sığdı. Varsayılan 50 vnode seçimi bu yüzden doğru.
+- **Mutasyon denemesi:** Sunucunun kapasitesi bilerek 255'e düşürülünce tahmin ile ölçüm 4/4 çalıştırmada uyuşmadı (ör. tahmin 733, ölçüm 724). Karşılaştırma, sunucudaki bir sınır hatasını yakalıyor.
+
+### test_sharding_cluster.py
+
+- **Karar:** Testler rastgele boş portlar kullanıyor; dağılım portlara bağlı olduğu için sabit sayı beklenmiyor. Test, seçilen portlarla her SET'in sonucunu (OK ya da ERR FULL) ve her sunucunun STATS'ını make_placement ile önceden hesaplıyor ve **birebir** eşitlik bekliyor. Şanssız bir port kümesinde de (bir sunucu 256'yı aşıyor) doğru çalışıyor; kontrol "yaklaşık" değil "tam".
+- **Kapsam (ring ve mod N için 5'er test):** 600 key tahmine birebir uyuyor ve toplam 256'yı aşıyor; her key yalnızca sahibinde (diğer sunucular `ERR WRONG_NODE <sahip>`); yanlış sunucuya SET yazılmıyor; bir sunucu kapalıyken yalnızca onun key'leri okunamıyor (replikasyon yok, Level 4'ün gerekçesi); ShardedClient testi (Öğrenci2'nin kodu gelene kadar atlanıyor).
+- **Mutasyon denemesi:** Sunucu bilerek bir fazla sanal düğüm kullanınca ring testleri başarısız oldu.
+- **Test:** Windows 11'de 225 test (2 atlandı), 199 sn.
+
+### Açık
+
+- ShardedClient gelince `test_sharded_client` çalışacak; `load_shard_config` gelince start_cluster'daki geçici import silinecek.
+- Rapor için grafik: yer değiştirme oranı (düzen başına çubuk, aralık hata çubuğu) ve ilk ERR FULL (vnode sayısına göre).
