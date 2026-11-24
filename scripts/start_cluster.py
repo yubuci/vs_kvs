@@ -1,11 +1,19 @@
 """
-Kümeyi tek komutla başlatır: 1 primary + N backup (varsayılan 3 sunucu).
+Kümeyi tek komutla başlatır.
+
+İki mod, yapılandırma dosyasından anlaşılır:
+  - Level 2 (replikasyon): dosyadaki sunucuların "role" alanı var -> 1 primary + N backup
+  - Level 3 (sharding):    "role" alanı yok -> her sunucu "--cluster <dosya>" ile başlar,
+                           key'ler sunuculara bölünür (bkz. docs/level3_gorevler.md, 3.6)
 
 Çalıştırma (depo kökünden):
     python -m scripts.start_cluster                       # servers.json ya da varsayılan küme
     python -m scripts.start_cluster --config servers.json
-    python -m scripts.start_cluster --replication off     # herkes rolsüz (Level 1 davranışı, Level 3 için)
+    python -m scripts.start_cluster --replication off     # herkes rolsüz (Level 1 davranışı)
     python -m scripts.start_cluster --log-dir logs        # her sunucunun çıktısı ayrı dosyaya
+    python -m scripts.start_cluster --config servers_level3.json                  # sharding
+    python -m scripts.start_cluster --config servers_level3.json --vnodes 10      # dosyadakini geçersiz kıl
+    python -m scripts.start_cluster --config servers_level3.json --placement modn
 
 Ctrl+C ile bütün sunucular kapatılır.
 
@@ -21,6 +29,14 @@ import sys
 import time
 
 from client.client import KVClient, KVError
+
+# TODO(Level 3): Öğrenci2'nin common/config.py'sine load_shard_config gelince yalnızca
+# ilk import kalır. O zamana kadar Öğrenci1'in server.py'deki geçici yedeği kullanılır
+# (aynı sözleşme, docs/level3_gorevler.md 3.3); kod iki yerde yazılmasın diye kopyalanmadı.
+try:
+    from common.config import ConfigError, load_shard_config
+except ImportError:
+    from server.server import ConfigError, load_shard_config
 
 # Depo kökü: betik nereden çağrılırsa çağrılsın sunucular buradan başlatılır
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -75,9 +91,51 @@ def addr(server):
     return f"{server['host']}:{server['port']}"
 
 
-def build_command(server, servers, replication):
-    """Bir sunucuyu başlatacak komut satırını üretir (docs/level2_gorevler.md, bölüm 2.1)."""
+def is_shard_file(path):
+    """Dosya Level 3 (sharding) yapılandırması mı? Sunucularda "role" alanı yoksa evet."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        servers = data["servers"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return False                                 # okunamıyorsa Level 2 yolu hatayı anlaşılır biçimde verir
+    return bool(servers) and all(isinstance(s, dict) and "role" not in s for s in servers)
+
+
+def load_shard_servers(path):
+    """Level 3 dosyasını okur: (sunucular, placement, vnodes). Hatalarda ClusterError."""
+    try:
+        config = load_shard_config(path)
+    except ConfigError as e:
+        raise ClusterError(str(e)) from e
+    return config["servers"], config["placement"], config["vnodes"]
+
+
+def write_shard_config(path, servers, placement="ring", vnodes=50):
+    """Geçici bir Level 3 yapılandırma dosyası yazar (test ve ölçüm betikleri için).
+
+    servers: [{"host", "port"}, ...]. Sunucular bu dosyayı --cluster ile okur.
+    """
+    data = {"placement": placement, "vnodes": vnodes,
+            "servers": [{"host": s["host"], "port": s["port"]} for s in servers]}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def build_command(server, servers, replication, cluster_file=None, placement=None, vnodes=None):
+    """Bir sunucuyu başlatacak komut satırını üretir.
+
+    Level 2: docs/level2_gorevler.md, bölüm 2.1. Level 3 (cluster_file verilirse):
+    docs/level3_gorevler.md, bölüm 3.4; placement / vnodes dosyadakini geçersiz kılar.
+    """
     cmd = [sys.executable, "-m", "server.server", "--host", server["host"], "--port", str(server["port"])]
+    if cluster_file:
+        cmd += ["--cluster", cluster_file]
+        if placement:
+            cmd += ["--placement", placement]
+        if vnodes is not None:
+            cmd += ["--vnodes", str(vnodes)]
+        return cmd                                   # sharding: rol yok (replikasyon Level 4)
     if not replication:
         return cmd                                   # rolsüz: Level 1 davranışı
 
@@ -126,13 +184,20 @@ def wait_ready(proc, host, port, timeout=READY_TIMEOUT):
     raise ClusterError(f"{host}:{port} {timeout:g} sn içinde hazır olmadı")
 
 
-def start_cluster(servers, replication=True, log_dir=None, quiet=False):
+def start_cluster(servers, replication=True, log_dir=None, quiet=False,
+                  cluster_file=None, placement=None, vnodes=None):
     """Sunucuları başlatır ve hepsi hazır olunca [(server, proc), ...] döndürür.
 
-    Sıra: önce primary, sonra backup'lar. Bir backup açılırken primary'den SYNC
+    Level 2: önce primary, sonra backup'lar. Bir backup açılırken primary'den SYNC
     çektiği için primary'nin o anda dinliyor olması gerekir.
+    Level 3: cluster_file verilirse her sunucu "--cluster cluster_file" ile başlar
+    (replication yok sayılır). servers, o dosyadaki sunucularla aynı olmalı.
     Bir sunucu başlamazsa o ana kadar başlatılanlar kapatılır ve ClusterError fırlatılır.
     """
+    if cluster_file:
+        replication = False
+        # Sunucular depo kökünde başlar; göreli yol orada başka bir yeri gösterebilir
+        cluster_file = os.path.abspath(cluster_file)
     check_config(servers, replication)
     if replication:
         ordered = sorted(servers, key=lambda s: s.get("role") != "primary")   # primary başa
@@ -152,8 +217,8 @@ def start_cluster(servers, replication=True, log_dir=None, quiet=False):
                 out = subprocess.DEVNULL
             else:
                 out = None                           # sunucu logu bu terminale akar ([port] önekiyle)
-            proc = subprocess.Popen(build_command(server, servers, replication),
-                                    cwd=REPO_ROOT, stdout=out, stderr=out)
+            cmd = build_command(server, servers, replication, cluster_file, placement, vnodes)
+            proc = subprocess.Popen(cmd, cwd=REPO_ROOT, stdout=out, stderr=out)
             running.append((server, proc))
             wait_ready(proc, server["host"], server["port"])
     except BaseException:
@@ -187,14 +252,33 @@ def main():
                         help="off: bütün sunucular rolsüz başlar (Level 1 davranışı)")
     parser.add_argument("--log-dir", default=None,
                         help="her sunucunun çıktısını bu klasörde <port>.log dosyasına yaz")
+    parser.add_argument("--placement", choices=["ring", "modn"], default=None,
+                        help="yalnızca Level 3 dosyasıyla: dosyadaki yerleştirmeyi geçersiz kıl")
+    parser.add_argument("--vnodes", type=int, default=None,
+                        help="yalnızca Level 3 dosyasıyla: dosyadaki sanal düğüm sayısını geçersiz kıl")
     args = parser.parse_args()
     replication = args.replication == "on"
+    sharding = os.path.exists(args.config) and is_shard_file(args.config)
+    if not sharding and (args.placement or args.vnodes is not None):
+        parser.error("--placement / --vnodes yalnızca Level 3 yapılandırma dosyasıyla (role alanı olmayan) kullanılır")
+    if args.vnodes is not None and args.vnodes < 1:
+        parser.error("--vnodes en az 1 olmalı")
 
     try:
-        servers, from_file = load_config(args.config)
-        kaynak = args.config if from_file else "varsayılan küme (servers.json yok)"
-        print(f"Yapılandırma: {kaynak}")
-        running = start_cluster(servers, replication=replication, log_dir=args.log_dir)
+        if sharding:
+            servers, placement, vnodes = load_shard_servers(args.config)
+            placement = args.placement or placement
+            vnodes = vnodes if args.vnodes is None else args.vnodes
+            print(f"Yapılandırma: {args.config} (sharding: {placement}"
+                  + (f", {vnodes} sanal düğüm" if placement == "ring" else "") + ")")
+            running = start_cluster(servers, log_dir=args.log_dir, cluster_file=args.config,
+                                    placement=args.placement, vnodes=args.vnodes)
+            replication = False
+        else:
+            servers, from_file = load_config(args.config)
+            kaynak = args.config if from_file else "varsayılan küme (servers.json yok)"
+            print(f"Yapılandırma: {kaynak}")
+            running = start_cluster(servers, replication=replication, log_dir=args.log_dir)
     except ClusterError as e:
         print(f"Hata: {e}", file=sys.stderr)
         raise SystemExit(1)
@@ -203,7 +287,7 @@ def main():
 
     print("\nKüme hazır:")
     for server, proc in running:
-        rol = server.get("role", "-") if replication else "rolsüz"
+        rol = "shard" if sharding else (server.get("role", "-") if replication else "rolsüz")
         print(f"  {addr(server):<17} {rol:<8} pid {proc.pid}")
     print("Durdurmak için Ctrl+C.\n")
 

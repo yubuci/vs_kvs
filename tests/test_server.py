@@ -4,7 +4,12 @@ Run (from the repository root):
     python -m unittest tests.test_server -v
 """
 
+import json
+import os
 import socket
+import subprocess
+import sys
+import tempfile
 import threading
 import unittest
 
@@ -12,8 +17,11 @@ from client.client import KVClient
 from common.protocol import (
     ERR_FULL, ERR_KEY, ERR_UNKNOWN, MAX_KEYS, RESP_END, encode_line, format_sync, parse_entry,
 )
+from common.config import ConfigError
+from common.ring import HashRing, modn_node_for
 from server.server import (
-    ROLE_BACKUP, ROLE_PRIMARY, Node, execute, handle_client, parse_addr, parse_peers, serve,
+    ROLE_BACKUP, ROLE_PRIMARY, Node, cluster_settings, execute, handle_client, load_shard_config,
+    parse_addr, parse_peers, serve,
 )
 from server.store import Store
 
@@ -191,6 +199,167 @@ class TestSyncPrimary(unittest.TestCase):
         self.assertEqual([parse_entry(l) for l in lines[:-1]], [(1, "k1", "merhaba dünya"), (2, "k2", "x")])
         self.assertEqual(rep.alive_calls, [(HOST, 5001)])        # host from the connection, port from SYNC
         self.assertEqual(reader.readline().rstrip("\n"), "STATS 2")   # the connection stays usable
+
+
+# ---------------------------------------------------------------------------------------------
+# Level 3: sharding (--cluster)
+# ---------------------------------------------------------------------------------------------
+
+SERVERS3 = [{"host": HOST, "port": p} for p in (5000, 5001, 5002)]
+CONFIG3 = {"placement": "ring", "vnodes": 50, "servers": SERVERS3}
+
+
+def sharded_node(port=5000, config=CONFIG3, **overrides):
+    """A Node that belongs to the 3-server cluster in CONFIG3."""
+    placement, self_id, ports, _mode, _vnodes = cluster_settings(config, HOST, port, **overrides)
+    return Node(Store(), placement=placement, self_id=self_id, ports=ports)
+
+
+def key_owned_by(node, owner_port, prefix="k"):
+    """First key k0, k1, ... whose owner is the server on owner_port."""
+    want = f"{HOST}:{owner_port}"
+    return next(k for k in (f"{prefix}{i}" for i in range(10_000)) if node.placement(k) == want)
+
+
+class TestShardingExecute(unittest.TestCase):
+    def setUp(self):
+        self.node = sharded_node(5000)
+
+    def test_kendi_keyini_kabul_eder(self):
+        key = key_owned_by(self.node, 5000)
+        self.assertEqual(execute(self.node, f"SET {key} merhaba dünya"), "OK")
+        self.assertEqual(execute(self.node, f"GET {key}"), "VALUE merhaba dünya")
+        self.assertEqual(execute(self.node, "STATS"), "STATS 1")
+
+    def test_baskasinin_keyi_wrong_node(self):
+        for owner in (5001, 5002):
+            key = key_owned_by(self.node, owner)
+            self.assertEqual(execute(self.node, f"SET {key} v"), f"ERR WRONG_NODE {owner}")
+            self.assertEqual(execute(self.node, f"GET {key}"), f"ERR WRONG_NODE {owner}")
+        self.assertEqual(execute(self.node, "STATS"), "STATS 0")   # nothing was written
+
+    def test_stats_kontrol_edilmez(self):
+        # STATS has no key: every server answers with its own count
+        for port in (5000, 5001, 5002):
+            self.assertEqual(execute(sharded_node(port), "STATS"), "STATS 0")
+
+    def test_bicim_hatasi_sahiplikten_once(self):
+        key = key_owned_by(self.node, 5001)
+        self.assertEqual(execute(self.node, f"SET {key}"), "ERR VALUE")          # missing value
+        self.assertEqual(execute(self.node, "SET " + "x" * 17 + " v"), "ERR KEY")
+
+    def test_her_key_tam_olarak_bir_sunucuda_kabul_edilir(self):
+        nodes = {p: sharded_node(p) for p in (5000, 5001, 5002)}
+        for i in range(300):
+            accepted = [p for p, n in nodes.items() if execute(n, f"SET k{i} v") == "OK"]
+            self.assertEqual(len(accepted), 1, f"k{i}")
+            # the other two point to the one that accepted
+            for p, n in nodes.items():
+                if p != accepted[0]:
+                    self.assertEqual(execute(n, f"GET k{i}"), f"ERR WRONG_NODE {accepted[0]}")
+        self.assertEqual(sum(n.store.count() for n in nodes.values()), 300)
+
+    def test_kumede_olmayan_sunucu_kontrol_yapmaz(self):
+        node = Node(Store())                         # Level 1: no placement
+        for i in range(50):
+            self.assertEqual(execute(node, f"SET k{i} v"), "OK")
+
+
+class TestClusterSettings(unittest.TestCase):
+    def test_dosyadaki_ayarlar(self):
+        placement, self_id, ports, mode, vnodes = cluster_settings(CONFIG3, HOST, 5001)
+        self.assertEqual(self_id, "127.0.0.1:5001")
+        self.assertEqual(ports, {"127.0.0.1:5000": 5000, "127.0.0.1:5001": 5001, "127.0.0.1:5002": 5002})
+        self.assertEqual((mode, vnodes), ("ring", 50))
+        ring = HashRing(list(ports))
+        self.assertTrue(all(placement(f"k{i}") == ring.node_for(f"k{i}") for i in range(200)))
+
+    def test_placement_ve_vnodes_dosyayi_gecersiz_kilar(self):
+        placement, _, ports, mode, _ = cluster_settings(CONFIG3, HOST, 5000, placement="modn")
+        self.assertEqual(mode, "modn")
+        self.assertTrue(all(placement(f"k{i}") == modn_node_for(f"k{i}", list(ports)) for i in range(200)))
+
+        placement, _, ports, _, vnodes = cluster_settings(CONFIG3, HOST, 5000, vnodes=1)
+        self.assertEqual(vnodes, 1)
+        ring = HashRing(list(ports), vnodes=1)
+        self.assertTrue(all(placement(f"k{i}") == ring.node_for(f"k{i}") for i in range(200)))
+
+    def test_kendi_adresi_listede_yok(self):
+        with self.assertRaises(ValueError) as cm:
+            cluster_settings(CONFIG3, HOST, 5009)
+        self.assertIn("127.0.0.1:5009", str(cm.exception))
+
+    def test_localhost_ayri_bir_dugumdur(self):
+        # The node id is "host:port" as written; localhost is NOT the same text as 127.0.0.1
+        with self.assertRaises(ValueError):
+            cluster_settings(CONFIG3, "localhost", 5000)
+
+
+class TestLoadShardConfig(unittest.TestCase):
+    """load_shard_config, whichever version is in use (stand-in in server.py or Öğrenci2's)."""
+
+    def write(self, data):
+        fd, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(data if isinstance(data, str) else json.dumps(data))
+        self.addCleanup(os.remove, path)
+        return path
+
+    def test_varsayilanlar(self):
+        cfg = load_shard_config(self.write({"servers": SERVERS3}))
+        self.assertEqual(cfg["placement"], "ring")
+        self.assertEqual(cfg["vnodes"], 50)
+        self.assertEqual(cfg["servers"], SERVERS3)
+
+    def test_hatali_dosyalar(self):
+        level2 = {"servers": [{"host": HOST, "port": 5000, "role": "primary"}]}
+        for data in [level2, {"servers": []}, {"placement": "x", "servers": SERVERS3},
+                     {"vnodes": 0, "servers": SERVERS3}, "{bozuk json"]:
+            with self.subTest(data=data):
+                with self.assertRaises(ConfigError):
+                    load_shard_config(self.write(data))
+
+    def test_dosya_yok(self):
+        with self.assertRaises(ConfigError):
+            load_shard_config(os.path.join(tempfile.gettempdir(), "yok_boyle_bir_dosya.json"))
+
+
+class TestClusterKomutSatiri(unittest.TestCase):
+    """The server must refuse to start with an invalid Level 3 command line (exit code 2)."""
+
+    def write_config(self, data=CONFIG3):
+        fd, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        self.addCleanup(os.remove, path)
+        return path
+
+    def run_server(self, *args):
+        # Each case fails while parsing arguments, before any socket is opened
+        return subprocess.run([sys.executable, "-m", "server.server", *args],
+                              capture_output=True, text=True, timeout=30)
+
+    def test_cluster_ile_role_birlikte_hata(self):
+        r = self.run_server("--port", "5000", "--cluster", self.write_config(), "--role", "primary")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--role", r.stderr)
+
+    def test_kendi_adresi_listede_yoksa_acilmaz(self):
+        r = self.run_server("--port", "5009", "--cluster", self.write_config())
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("127.0.0.1:5009", r.stderr)
+
+    def test_level2_dosyasi_reddedilir(self):
+        level2 = {"servers": [{"host": HOST, "port": 5000, "role": "primary"}]}
+        r = self.run_server("--port", "5000", "--cluster", self.write_config(level2))
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("role", r.stderr)
+
+    def test_cluster_olmadan_placement_hata(self):
+        r = self.run_server("--port", "5000", "--placement", "modn")
+        self.assertEqual(r.returncode, 2)
+        r = self.run_server("--port", "5000", "--cluster", self.write_config(), "--vnodes", "0")
+        self.assertEqual(r.returncode, 2)
 
 
 class TestServe(unittest.TestCase):
