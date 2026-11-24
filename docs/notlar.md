@@ -173,3 +173,68 @@
 
 - Öğrenci2'nin `protocol.py` 1.2 ve `config.py` değişiklikleri gelince geçici yedekler silinecek.
 - `ShardedClient` ve `start_cluster` sharding modu gelince gerçek kümede 600 key denemesi.
+
+
+## 2026-11-25 (Öğrenci3, Level 3: start_cluster, ölçümler, entegrasyon testleri)
+
+### start_cluster.py (sharding modu)
+
+- **Karar:** Mod dosyadan anlaşılıyor: sunucularda `role` alanı yoksa Level 3 (sharding), varsa Level 2. Böylece tek bir komut iki level'ı da açıyor; `--placement` / `--vnodes` yalnızca Level 3 dosyasıyla kabul ediliyor.
+- **Karar:** Yapılandırma dosyasının yolu sunuculara mutlak yol olarak veriliyor; sunucular depo kökünde başladığı için göreli bir yol orada başka bir dosyayı gösterebilirdi.
+- **Karar (geçici):** `load_shard_config` henüz yok (Öğrenci2). Kodu ikinci kez yazmamak için Öğrenci1'in `server.py`'deki geçici yedeği import ediliyor (`TODO(Level 3)`); gerçek fonksiyon gelince kendiliğinden o kullanılıyor.
+- **Karar:** `write_shard_config()` test ve ölçüm betiklerinin geçici yapılandırma dosyası yazması için.
+
+### measure_rebalance.py (sunucusuz)
+
+- **Yöntem:** 10.000 key, düzenler mod N ve ring (vnode 1, 10, 50, 200); 3 -> 4 ve 4 -> 3 sunucu. Ring sonucu sunucu adlarına (dolayısıyla portlara) bağlı olduğu için 5 port kümesiyle tekrarlandı (5000, 5100, ... 5400); tabloda en küçük – en büyük.
+- **Platformdan bağımsızlık:** Windows 11 ve Linux'ta sayılar her hücrede birebir aynı çıktı (md5 deterministik).
+
+| Düzen | Beklenen | 3 -> 4 yer değiştiren | Eski sunucular arasında taşınan |
+|---|---|---|---|
+| mod N | ~%75 | %75,0 | 5.046 |
+| ring, vnode 1 | ~%25 | %19,3 – %51,2 | 0 |
+| ring, vnode 10 | ~%25 | %20,9 – %36,2 | 0 |
+| ring, vnode 50 | ~%25 | %18,3 – %25,9 | 0 |
+| ring, vnode 200 | ~%25 | %24,3 – %26,1 | 0 |
+
+| Düzen (3 sunucu, ideal 3.333) | En büyük / ideal | Std. sapma (idealin %'si) |
+|---|---|---|
+| mod N | 1,00 | 0,4 |
+| ring, vnode 1 | 1,45 – 2,16 | 42,9 – 83,1 |
+| ring, vnode 10 | 1,14 – 1,36 | 12,5 – 26,8 |
+| ring, vnode 50 | 1,06 – 1,40 | 4,5 – 28,6 |
+| ring, vnode 200 | 1,04 – 1,09 | 2,9 – 6,7 |
+
+- **Gözlem (araştırma sorusunun cevabı):** mod N'de sunucu eklenince key'lerin dörtte üçü yer değiştiriyor ve bunların çoğu (5.046) yeni sunucuya değil, **eski sunucular arasında** gidip geliyor. Ring'de yer değiştiren key'lerin hepsi yeni sunucuya gidiyor; eski sunucular arasında taşınan key sayısı her düzende ve her port kümesinde **0**. Bu, consistent hashing'in tanımlayıcı özelliği.
+- **Gözlem (değiş tokuş):** mod N en dengeli dağıtımı veriyor (sapma %0,4), ama yeniden dağıtımda en kötüsü. Ring yeniden dağıtımda iyi, ama dengeyi ancak yeterince sanal düğümle sağlıyor.
+- **Gözlem:** Az sanal düğümle ring'in sonucu port kümesine göre çok oynuyor (vnode 1: yer değiştirme %19 ile %51, bir port kümesinde bir sunucuya yalnızca 52 key). vnode 200'de aralık %24–26'ya daralıyor. Raporda tek sayı yerine aralık verilmeli.
+- **Gözlem:** 3 -> 4 ile 4 -> 3 aynı çıkıyor (aynı key'ler ters yönde taşınıyor). mod N'in port kümesinden etkilenmemesi de beklenen: mod N sunucuların adına değil yalnızca sırasına bakıyor.
+
+### measure_first_full.py (gerçek küme + tahmin)
+
+- **Yöntem:** 3 sunucu (portlar 5000–5002), benzersiz key'ler tek tek sahibine yazılıyor (`make_placement` + `KVClient`; ShardedClient beklenmedi). Her düzen 5 farklı key kümesiyle. Aynı sayılar ring.py ile sunucusuz olarak da **önceden hesaplanıyor**; ölçüm ile tahminin birebir aynı olması bekleniyor.
+- **Sonuç (Windows 11; Linux'ta da aynı):**
+
+| Düzen | İlk ERR FULL (medyan) | Aralık | 600 key'de ERR FULL (medyan) | 600 key sığdı | Tahmin = ölçüm |
+|---|---|---|---|---|---|
+| mod N | 742 | 706 – 761 | 0 | 5/5 | 5/5 |
+| ring, vnode 1 | 539 | 488 – 561 | 33 | 0/5 | 5/5 |
+| ring, vnode 10 | 577 | 532 – 651 | 10 | 1/5 | 5/5 |
+| ring, vnode 50 | 728 | 688 – 748 | 0 | 5/5 | 5/5 |
+| ring, vnode 200 | 722 | 688 – 744 | 0 | 5/5 | 5/5 |
+
+- **Gözlem:** Teorik üst sınır 768, ama ilk ERR FULL en iyi durumda bile ~720–740. key'de geliyor; vnode 1'de ~540. key'de. "3 sunucu = 768 kayıt" yalnızca teorik üst sınır (Fragestellung'daki "Kapazität wächst mit der Knotenzahl" iddiası Fazit'te nitelendirilmeli).
+- **Gözlem:** 600 key demosu vnode 1'de hiç, vnode 10'da 5 denemeden yalnızca birinde sığdı; vnode 50 ve 200'de her zaman sığdı. Varsayılan 50 vnode seçimi bu yüzden doğru.
+- **Mutasyon denemesi:** Sunucunun kapasitesi bilerek 255'e düşürülünce tahmin ile ölçüm 4/4 çalıştırmada uyuşmadı (ör. tahmin 733, ölçüm 724). Karşılaştırma, sunucudaki bir sınır hatasını yakalıyor.
+
+### test_sharding_cluster.py
+
+- **Karar:** Testler rastgele boş portlar kullanıyor; dağılım portlara bağlı olduğu için sabit sayı beklenmiyor. Test, seçilen portlarla her SET'in sonucunu (OK ya da ERR FULL) ve her sunucunun STATS'ını make_placement ile önceden hesaplıyor ve **birebir** eşitlik bekliyor. Şanssız bir port kümesinde de (bir sunucu 256'yı aşıyor) doğru çalışıyor; kontrol "yaklaşık" değil "tam".
+- **Kapsam (ring ve mod N için 5'er test):** 600 key tahmine birebir uyuyor ve toplam 256'yı aşıyor; her key yalnızca sahibinde (diğer sunucular `ERR WRONG_NODE <sahip>`); yanlış sunucuya SET yazılmıyor; bir sunucu kapalıyken yalnızca onun key'leri okunamıyor (replikasyon yok, Level 4'ün gerekçesi); ShardedClient testi (Öğrenci2'nin kodu gelene kadar atlanıyor).
+- **Mutasyon denemesi:** Sunucu bilerek bir fazla sanal düğüm kullanınca ring testleri başarısız oldu.
+- **Test:** Windows 11'de 225 test (2 atlandı), 199 sn.
+
+### Açık
+
+- ShardedClient gelince `test_sharded_client` çalışacak; `load_shard_config` gelince start_cluster'daki geçici import silinecek.
+- Rapor için grafik: yer değiştirme oranı (düzen başına çubuk, aralık hata çubuğu) ve ilk ERR FULL (vnode sayısına göre).
