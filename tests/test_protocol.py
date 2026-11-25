@@ -16,6 +16,8 @@ from common.protocol import (
     CMD_REPL, CMD_SYNC, ERR_NOT_PRIMARY, MAX_PORT, RESP_END,
     _parse_positive_int, format_entry, format_not_primary, format_repl, format_sync,
     parse_entry, parse_not_primary,
+    # Level 3
+    ERR_WRONG_NODE, format_wrong_node, parse_wrong_node,
 )
 
 
@@ -270,6 +272,7 @@ class TestRoundTrips(unittest.TestCase):
         self.assertEqual(format_sync(5001), "SYNC 5001")
         self.assertEqual(format_entry(7, "k1", "merhaba dünya"), "ENTRY 7 k1 merhaba dünya")
         self.assertEqual(format_not_primary(5000), "ERR NOT_PRIMARY 5000")
+        self.assertEqual(format_wrong_node(5001), "ERR WRONG_NODE 5001")   # Level 3
 
     def test_repl_round_trip(self):
         for value in ["merhaba", "merhaba güzel dünya", " başta ve sonda boşluk ", "şğüçöı İ"]:
@@ -321,6 +324,44 @@ class TestParseNotPrimary(unittest.TestCase):
                          "ERR NOT_PRIMARY -5", "ERR NOT_PRIMARY 5000 fazla"]:
             with self.subTest(response=response):
                 self.assertIsNone(parse_not_primary(response))
+
+
+class TestParseWrongNode(unittest.TestCase):
+    """Level 3: 'ERR WRONG_NODE <port>'. Same strictness as parse_not_primary (shared helper)."""
+
+    def test_valid(self):
+        self.assertEqual(parse_wrong_node("ERR WRONG_NODE 5001"), 5001)
+        self.assertEqual(parse_wrong_node(ERR_WRONG_NODE + " 1"), 1)            # lowest valid port
+        self.assertEqual(parse_wrong_node(ERR_WRONG_NODE + " 65535"), 65535)    # highest valid port
+
+    def test_round_trip(self):
+        for port in (1, 5000, 5002, 65535):
+            with self.subTest(port=port):
+                self.assertEqual(parse_wrong_node(format_wrong_node(port)), port)
+
+    def test_other_responses_return_none(self):
+        # Normal answers must pass through the parser untouched: the client calls it on EVERY response
+        for response in ["OK", "NOT_FOUND", "VALUE x", "STATS 3", "ERR KEY", "ERR FULL", "ERR UNKNOWN", ""]:
+            with self.subTest(response=response):
+                self.assertIsNone(parse_wrong_node(response))
+
+    def test_missing_or_misspelled_port_part(self):
+        for response in ["ERR WRONG_NODE", "ERR WRONG_NODE ", "ERR WRONG_NODE5001", "ERR WRONG_NODE  5001",
+                         "ERR WRONG_NODE_X 5001", "err wrong_node 5001", " ERR WRONG_NODE 5001"]:
+            with self.subTest(response=response):
+                self.assertIsNone(parse_wrong_node(response))
+
+    def test_bad_port(self):
+        for response in ["ERR WRONG_NODE abc", "ERR WRONG_NODE 0", "ERR WRONG_NODE 65536", "ERR WRONG_NODE -5",
+                         "ERR WRONG_NODE +5001", "ERR WRONG_NODE 50.01", "ERR WRONG_NODE 5001 extra",
+                         "ERR WRONG_NODE 5001 ", "ERR WRONG_NODE \u0665\u0660\u0660\u0661"]:   # last: Arabic-Indic digits
+            with self.subTest(response=response):
+                self.assertIsNone(parse_wrong_node(response))
+
+    def test_not_primary_is_not_wrong_node(self):
+        # The two redirects must never be confused with each other, in either direction
+        self.assertIsNone(parse_wrong_node(format_not_primary(5000)))
+        self.assertIsNone(parse_not_primary(format_wrong_node(5001)))
 
 
 if __name__ == "__main__":

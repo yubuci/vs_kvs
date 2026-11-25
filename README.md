@@ -117,3 +117,43 @@ docs/notlar.md        Entscheidungen und Probleme (Projekttagebuch)
 - Die Daten liegen nur im RAM: Beim Beenden des Servers gehen sie verloren.
 - Replikation nur vom Primary zu den Backups (Level 2); kein automatischer Primary-Wechsel (Level 5) und keine Partitionierung (Level 3).
 - Keine Authentifizierung und keine Verschlüsselung (laut Aufgabenstellung nicht verlangt).
+
+<!-- README.md dosyasına eklenecek "Level 3" bölümü -->
+
+## Level 3: sharding + consistent hashing
+
+Level 2'de üç sunucu aynı veriyi tutuyordu (kapasite 256). Level 3'te key'ler sunuculara bölünür:
+her key yalnızca sahibinde durur, üç sunucu birlikte 256'dan fazla kayıt saklar. Sahibi
+consistent hashing (sanal düğümlü hash ring) belirler. Replikasyon bu level'da kapalıdır.
+
+### Çalıştırma
+
+```bash
+# 1. Kümeyi başlat (servers_level3.json: 5000, 5001, 5002)
+python -m scripts.start_cluster --config servers_level3.json
+
+# 2. Başka bir terminalde: komutlar key'in sahibine gider
+python -m client.client --cluster servers_level3.json SET k1 merhaba
+python -m client.client --cluster servers_level3.json GET k1
+python -m client.client --cluster servers_level3.json            # shell; STATS toplamı ve sunucu başına sayıları gösterir
+
+# 3. Demo: 600 key, iki client, bir sunucuyu kapatma
+python -m scripts.demo_level3                  # ring, 50 sanal düğüm
+python -m scripts.demo_level3 --vnodes 1       # dengesiz: bir sunucu dolar (ERR FULL)
+python -m scripts.demo_level3 --placement modn # hash mod N ile karşılaştırma
+
+# 4. Testler
+python -m unittest discover -s tests -t .
+```
+
+Level 2 kümesi (`servers.json`) değişmeden çalışmaya devam eder.
+
+### Bilmeniz gerekenler
+
+- **Aynı yapılandırma dosyası** her sunucuda ve client'ta kullanılır; farklı dosyalar farklı ring demektir.
+  Yanlış sunucuya giden istek `ERR WRONG_NODE <port>` ile düzeltilir (client bir kez yönlenir).
+- **Failover yok:** bir sunucu kapanırsa onun key'leri okunamaz ve yazılamaz. Bu, Level 4'ün gerekçesidir.
+- **Kapasite eşit dağılmaz:** ilk dolan sunucu sınırı belirler; 3 × 256 = 768 yalnızca teorik üst sınırdır.
+- **Sunucu sayısı değişince key'ler taşınmaz:** yeni yapılandırmayla açılan küme boştur. Yer değiştirme
+  oranı bu yüzden çevrimdışı ölçülür (`tests/measure_rebalance.py`).
+- Protokol ayrıntıları: `docs/protokol.md`, sürüm 1.2.

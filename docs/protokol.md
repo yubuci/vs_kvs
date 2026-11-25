@@ -228,3 +228,80 @@ python -m client.client --servers servers.json GET k1
 |---|---|---|---|
 | 13.11.2026 | 1.0 | İlk sürüm | |
 | 18.11.2026 | 1.1 | `SYNC <port>` (argümansız `SYNC` artık geçersiz); `REPL`/`ENTRY`/`END` ayrıştırma kuralları; `seq` ve `port` yalnızca ASCII rakam, ≥ 1, `port` ≤ 65535; `REPL` kontrol sırası (komut, seq, key, value); satır uzunluğu hesabı (4122/4123); `ERR NOT_PRIMARY <port>` biçimi; client `--servers` yönlendirme kuralları | Öğrenci2 |
+
+
+## Sürüm 1.2 (Level 3): sharding
+
+Level 3'te key'ler sunucular arasında bölünür: her key yalnızca **bir** sunucuda (sahibinde) durur.
+Sahibi `common/ring.py` içindeki `make_placement(...)` belirler. Client, sunucu ve ölçüm betikleri
+yerleştirmeyi yalnızca bununla yapar. Düğüm kimliği her yerde `host:port` biçiminde yazılır
+(`127.0.0.1:5000`; `localhost` ile `127.0.0.1` iki farklı düğümdür).
+
+### Yeni cevap
+
+| Cevap | Ne zaman | Seviye |
+|---|---|---|
+| `ERR WRONG_NODE <port>` | Sunucuya, kendisine ait olmayan bir key için SET ya da GET geldi. `<port>`, key'in sahibi olan sunucunun portudur (cevabı veren sunucuyla aynı host). | 3 |
+
+Örnek:
+```
+client -> 127.0.0.1:5000:  GET k1
+5000   -> client:          ERR WRONG_NODE 5001
+client -> 127.0.0.1:5001:  GET k1
+5001   -> client:          VALUE merhaba
+```
+
+### Kurallar
+
+1. **Hangi komutlar kontrol edilir:** yalnızca `SET` ve `GET`. `STATS` kontrolsüzdür: her sunucu
+   kendi kayıt sayısını döndürür.
+2. **Kontrol sırası (sunucu):** önce komutun kendisi doğrulanır (`ERR KEY`, `ERR VALUE`,
+   `ERR UNKNOWN`), sonra sahiplik. Yani geçersiz bir key'e her sunucu aynı `ERR KEY` cevabını verir.
+3. **Cevabın biçimi:** `ERR WRONG_NODE`, tek boşluk, port (yalnızca ASCII rakamlar, 1–65535).
+   Başka her şey (port yok, harf, 0, 65536, fazladan metin) WRONG_NODE sayılmaz.
+   `ERR NOT_PRIMARY <port>` (Level 2) ile **karıştırılmaz**.
+4. **Client kuralı:** WRONG_NODE alan client komutu o porta **bir kez** tekrarlar. İkinci cevap da
+   WRONG_NODE ise client hata verir (sonsuz yönlendirme yok): sunucular ve client farklı
+   yapılandırma, yani farklı ring kullanıyor demektir.
+5. **Failover yok:** key'in sahibi kapalıysa komut başarısız olur; başka bir sunucuya yazılmaz.
+   Bu, Level 3'ün bilinen sınırıdır (Level 4'ün gerekçesi).
+6. **Client'ın STATS'ı:** `ShardedClient` `STATS` komutunu her sunucuya sorar ve `STATS <toplam>`
+   döndürür. Bir sunucuya ulaşılamazsa toplam verilmez (eksik bir toplam, veri kaybı gibi görünürdü);
+   bunun yerine hata verir. Sunucu başına sayılar için `stats_per_server()` kullanılır.
+   Bu, protokolün değil client'ın bir özelliğidir: sunucuya giden satır hâlâ yalnızca `STATS`'tır.
+7. **Anahtarsız satırlar:** key'i olmayan ya da SET/GET/STATS olmayan bir satır (ör. `SET`, `FOO x`)
+   yönlendirilemez; client listedeki ilk sunucuya yollar, `ERR ...` cevabını sunucu verir.
+   Client key ya da value doğrulaması yapmaz: son söz sunucunundur.
+
+### Yapılandırma dosyası: `servers_level3.json`
+
+```json
+{
+  "placement": "ring",
+  "vnodes": 50,
+  "servers": [
+    {"host": "127.0.0.1", "port": 5000},
+    {"host": "127.0.0.1", "port": 5001},
+    {"host": "127.0.0.1", "port": 5002}
+  ]
+}
+```
+
+- `placement`: `"ring"` (consistent hashing) ya da `"modn"` (hash mod N, karşılaştırma için). Yoksa `"ring"`.
+- `vnodes`: ring'de sunucu başına sanal nokta sayısı, tam sayı ≥ 1. Yoksa 50. `modn` bunu kullanmaz.
+- `servers`: boş olmayan liste; `host` boş olmayan metin, `port` 1–65535 arası tam sayı, aynı adres iki kez yazılamaz.
+- **`role` alanı yasaktır.** Varsa dosya Level 2'nindir (`servers.json`) ve reddedilir.
+- Aynı dosya **her sunucuda ve client'ta** kullanılmalıdır. Farklı dosyalar farklı ring demektir.
+  Sunucunun WRONG_NODE kontrolü bunu fark eder ama düzeltemez.
+
+### Komut satırı
+
+```
+python -m server.server --port 5000 --cluster servers_level3.json [--placement ring|modn] [--vnodes 50]
+python -m client.client --cluster servers_level3.json SET k1 merhaba
+python -m client.client --cluster servers_level3.json            # shell: STATS toplamı + sunucu başına sayılar
+python -m client.client --cluster servers_level3.json --placement modn GET k1
+```
+
+`--cluster`, `--port` ve `--servers` ile birlikte kullanılamaz. `--placement` yalnızca `--cluster` ile
+kullanılır ve dosyadaki değeri geçersiz kılar.
