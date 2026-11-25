@@ -12,12 +12,20 @@ import os
 import tempfile
 import unittest
 
-from common.config import ConfigError, backups_of, load_servers, primary_of
+from common.config import (
+    ConfigError, VALID_PLACEMENTS, backups_of, load_servers, load_shard_config, primary_of,
+)
+from common.ring import DEFAULT_VNODES, make_placement
 
 # A valid cluster; tests copy it and break one thing at a time
 PRIMARY = {"host": "127.0.0.1", "port": 5000, "role": "primary"}
 BACKUP1 = {"host": "127.0.0.1", "port": 5001, "role": "backup"}
 BACKUP2 = {"host": "127.0.0.1", "port": 5002, "role": "backup"}
+
+# Level 3: the same three addresses without a role
+NODE0 = {"host": "127.0.0.1", "port": 5000}
+NODE1 = {"host": "127.0.0.1", "port": 5001}
+NODE2 = {"host": "127.0.0.1", "port": 5002}
 
 
 class ConfigTestCase(unittest.TestCase):
@@ -43,6 +51,13 @@ class ConfigTestCase(unittest.TestCase):
         path = self.write(content)
         with self.assertRaises(ConfigError) as ctx:
             load_servers(path)
+        self.assertIn(fragment, str(ctx.exception))
+
+    def assertShardError(self, content, fragment=""):
+        """Same as assertConfigError, but for load_shard_config (Level 3)."""
+        path = self.write(content, "servers_level3.json")
+        with self.assertRaises(ConfigError) as ctx:
+            load_shard_config(path)
         self.assertIn(fragment, str(ctx.exception))
 
 
@@ -143,6 +158,131 @@ class TestHelpers(unittest.TestCase):
 
     def test_backups_of_without_backups_is_empty(self):
         self.assertEqual(backups_of([PRIMARY]), [])
+
+
+class TestLoadShardConfig(ConfigTestCase):
+    """Level 3: servers_level3.json. Mirrors TestLoadServers, one broken thing per test."""
+
+    def load(self, content):
+        return load_shard_config(self.write(content, "servers_level3.json"))
+
+    def test_valid_file(self):
+        config = self.load({"placement": "modn", "vnodes": 10, "servers": [NODE0, NODE1, NODE2]})
+        self.assertEqual(config, {"placement": "modn", "vnodes": 10, "servers": [NODE0, NODE1, NODE2]})
+
+    def test_defaults(self):
+        # placement missing -> "ring"; vnodes missing -> the ring's own default (50)
+        config = self.load({"servers": [NODE0, NODE1]})
+        self.assertEqual(config["placement"], "ring")
+        self.assertEqual(config["vnodes"], DEFAULT_VNODES)
+        self.assertEqual(DEFAULT_VNODES, 50)                 # the value the contract promises
+
+    def test_server_order_is_kept(self):
+        config = self.load({"servers": [NODE2, NODE0, NODE1]})
+        self.assertEqual(config["servers"], [NODE2, NODE0, NODE1])
+
+    def test_single_server_is_valid(self):
+        self.assertEqual(len(self.load({"servers": [NODE0]})["servers"]), 1)
+
+    def test_unknown_extra_fields_are_dropped(self):
+        config = self.load({"comment": "x", "servers": [dict(NODE0, label="main")]})
+        self.assertEqual(config["servers"], [NODE0])
+
+    def test_the_real_servers_level3_json_is_valid(self):
+        # Like servers.json: the file in the repository root is part of the contract
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        config = load_shard_config(os.path.join(root, "servers_level3.json"))
+        self.assertEqual(len(config["servers"]), 3)
+        self.assertIn(config["placement"], VALID_PLACEMENTS)
+
+    def test_file_problems(self):
+        with self.assertRaises(ConfigError) as ctx:                       # missing file
+            load_shard_config(os.path.join(self.dir, "nope.json"))
+        self.assertIn("not found", str(ctx.exception))
+        with self.assertRaises(ConfigError):                              # a directory
+            load_shard_config(self.dir)
+        self.assertShardError("{ not json", "not valid JSON")
+        self.assertShardError(b"\xff\xfe\x00bad", "not valid JSON")       # not UTF-8
+
+    def test_structure_problems(self):
+        self.assertShardError([NODE0], "servers")                          # top level is a list
+        self.assertShardError({"placement": "ring"}, "servers")            # no servers key
+        self.assertShardError({"servers": "127.0.0.1:5000"}, "servers")    # servers is not a list
+        self.assertShardError({"servers": []}, "empty")
+        self.assertShardError({"servers": [NODE0, "127.0.0.1:5001"]}, "server #2")   # entry not an object
+
+    def test_unknown_placement(self):
+        for placement in ("Ring", "hash", "", None, 3, ["ring"]):          # case matters, wrong types
+            with self.subTest(placement=placement):
+                self.assertShardError({"placement": placement, "servers": [NODE0]}, "placement")
+
+    def test_bad_vnodes(self):
+        # 0 and negatives make no ring; True is an int in Python (the same trap as the port); text, float, None
+        for vnodes in (0, -1, True, False, "50", 50.0, None):
+            with self.subTest(vnodes=vnodes):
+                self.assertShardError({"vnodes": vnodes, "servers": [NODE0]}, "vnodes")
+
+    def test_vnodes_is_checked_even_in_modn_mode(self):
+        # modn ignores vnodes, but a nonsense value in the file is still a mistake worth reporting
+        self.assertShardError({"placement": "modn", "vnodes": 0, "servers": [NODE0]}, "vnodes")
+
+    def test_role_field_means_level2_file(self):
+        self.assertShardError({"servers": [NODE0, dict(NODE1, role="backup")]}, "Level 2")
+
+    def test_the_real_level2_servers_json_is_rejected(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with self.assertRaises(ConfigError) as ctx:
+            load_shard_config(os.path.join(root, "servers.json"))
+        self.assertIn("Level 2", str(ctx.exception))
+
+    def test_missing_host_or_port(self):
+        self.assertShardError({"servers": [{"port": 5000}]}, '"host"')
+        self.assertShardError({"servers": [{"host": "127.0.0.1"}]}, '"port"')
+
+    def test_wrong_types(self):
+        bad_entries = [
+            dict(NODE1, port="5001"), dict(NODE1, port=True), dict(NODE1, port=5001.0),
+            dict(NODE1, host=127), dict(NODE1, host=""),
+        ]
+        for entry in bad_entries:
+            with self.subTest(entry=entry):
+                self.assertShardError({"servers": [NODE0, entry]}, "server #2")
+
+    def test_port_range(self):
+        for port in (0, -1, 65536):
+            with self.subTest(port=port):
+                self.assertShardError({"servers": [NODE0, dict(NODE1, port=port)]}, "port")
+        for port in (1, 65535):
+            with self.subTest(port=port):
+                self.assertEqual(len(self.load({"servers": [NODE0, dict(NODE1, port=port)]})["servers"]), 2)
+
+    def test_duplicate_address(self):
+        self.assertShardError({"servers": [NODE0, NODE1, dict(NODE2, port=5001)]}, "twice")
+
+    def test_localhost_and_127_are_different_addresses(self):
+        # Documented limit: node ids are compared as text, so these count as TWO nodes (the plan's rule 4:
+        # write every address the same way everywhere). If this test ever fails, the duplicate rule got smarter.
+        config = self.load({"servers": [NODE0, dict(NODE0, host="localhost")]})
+        self.assertEqual(len(config["servers"]), 2)
+
+    def test_level3_file_is_rejected_by_load_servers(self):
+        # The other direction: the Level 2 loader must not silently accept a sharding file
+        path = self.write({"servers": [NODE0, NODE1]})
+        with self.assertRaises(ConfigError):
+            load_servers(path)
+
+
+class TestPlacementContract(unittest.TestCase):
+    """config.py lists the placement names; ring.py implements them. They must agree."""
+
+    def test_every_listed_placement_is_implemented(self):
+        for mode in VALID_PLACEMENTS:
+            with self.subTest(mode=mode):
+                place = make_placement(mode, ["127.0.0.1:5000", "127.0.0.1:5001"])
+                self.assertIn(place("some-key"), ["127.0.0.1:5000", "127.0.0.1:5001"])
+
+    def test_the_names_the_contract_promises(self):
+        self.assertEqual(set(VALID_PLACEMENTS), {"ring", "modn"})
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ değişirse (ör. hoca "4080 bayt" derse) yalnızca bu dosya değişir.
 
 Kurallar için bkz. docs/protokol.md (sürüm 1.1).
 Sürüm 1.1 (Level 2): REPL, SYNC <port>, ENTRY/END ve ERR NOT_PRIMARY eklendi.
+Sürüm 1.2 (Level 3): ERR WRONG_NODE <port> eklendi (sharding).
 """
 
 from __future__ import annotations
@@ -46,6 +47,7 @@ ERR_VALUE = "ERR VALUE"
 ERR_FULL = "ERR FULL"
 ERR_UNKNOWN = "ERR UNKNOWN"
 ERR_NOT_PRIMARY = "ERR NOT_PRIMARY"   # Level 2: "ERR NOT_PRIMARY <port>" olarak gönderilir
+ERR_WRONG_NODE = "ERR WRONG_NODE"     # Level 3: "ERR WRONG_NODE <port>" olarak gönderilir
 
 
 class LineTooLongError(Exception):
@@ -314,13 +316,42 @@ def format_not_primary(port: int) -> str:
     return f"{ERR_NOT_PRIMARY} {port}"
 
 
+def _parse_err_port(response: str, code: str) -> Optional[int]:
+    """Shared by parse_not_primary and parse_wrong_node: '<code> <port>' -> port, else None.
+
+    Both redirect messages have the same shape ("ERR <NAME> <port>"), so the strict rules
+    live here, once. The match is exact: the code, ONE space, then only ASCII digits
+    (_parse_positive_int), and the number must be a valid TCP port (1..MAX_PORT).
+    Anything else returns None: a client must never be sent to a wrong or made-up port.
+    """
+    prefix = code + " "
+    if not response.startswith(prefix):
+        return None
+    return _parse_positive_int(response[len(prefix):], upper=MAX_PORT)
+
+
 def parse_not_primary(response: str) -> Optional[int]:
     """'ERR NOT_PRIMARY <port>' cevabından port'u çıkarır; başka bir cevap için None.
 
     "ERR NOT_PRIMARY" (port yok), "ERR NOT_PRIMARY abc" ve port'u 1..65535 dışında
     olan cevaplar da None döndürür: client yanlış bir porta yönlendirilmemeli.
     """
-    prefix = ERR_NOT_PRIMARY + " "
-    if not response.startswith(prefix):
-        return None
-    return _parse_positive_int(response[len(prefix):], upper=MAX_PORT)
+    return _parse_err_port(response, ERR_NOT_PRIMARY)
+
+
+def format_wrong_node(port: int) -> str:
+    """Level 3: a server's answer to a SET/GET for a key it does not own: 'ERR WRONG_NODE 5001'.
+
+    <port> is the port of the server that DOES own the key (same host as the answering server).
+    """
+    return f"{ERR_WRONG_NODE} {port}"
+
+
+def parse_wrong_node(response: str) -> Optional[int]:
+    """'ERR WRONG_NODE <port>' -> the port (5001); None for any other response.
+
+    Also None for a missing port, a non-numeric port, a port outside 1..65535 and extra text
+    after the port. ERR NOT_PRIMARY is NOT a WRONG_NODE: the two redirects mean different
+    things (Level 2 role vs Level 3 ownership) and must never be mixed up.
+    """
+    return _parse_err_port(response, ERR_WRONG_NODE)

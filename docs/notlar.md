@@ -268,3 +268,33 @@
 
 - ShardedClient gelince `test_sharded_client` çalışacak; `load_shard_config` gelince start_cluster'daki geçici import silinecek.
 - Rapor için grafik: yer değiştirme oranı (düzen başına çubuk, aralık hata çubuğu) ve ilk ERR FULL (vnode sayısına göre).
+
+<!-- docs/notlar.md dosyasının SONUNA, kendi tarih başlığınızın altına eklenecek taslak (rapor malzemesi) -->
+
+### Öğrenci2, Level 3 (25.11.2026)
+
+**Yapılanlar:** protokol 1.2 (`ERR WRONG_NODE`), `load_shard_config`, `servers_level3.json`,
+`ShardedClient` ve CLI (`--cluster`, `--placement`), `demo_level3.py`.
+
+**Tasarım kararları (rapor: 2.x / Diskussion)**
+- *Yerleştirme kararı client'ta.* Artı: tek adımda doğru sunucuya gidilir, sunucular birbirini
+  bilmek zorunda değildir. Eksi: her client yapılandırmayı bilmek zorundadır; eski ya da farklı
+  bir dosya yanlış sunucuya yazdırır. Çözüm: sunucu `WRONG_NODE` ile düzeltir (Redis Cluster'daki
+  MOVED yönlendirmesine benzer). İkinci WRONG_NODE'da client hata verir: bu, dosyaların farklı
+  olduğunun işaretidir ve sessizce dolaşmak yerine görünür kılınır.
+- *Failover yok.* Sahip kapalıysa komut başarısız olur; başka sunucuya yazmak aynı key'in iki
+  yerde bulunmasına yol açardı. Demo bunu gösterir: kapanan sunucunun key'leri tam olarak okunamayanlardır.
+- *Eksik STATS toplamı hata verir.* Ulaşılamayan sunucuyu sessizce atlayan bir toplam, veri
+  kaybı gibi görünürdü.
+- *Doğrulama kodu tek yerde.* `load_servers` ve `load_shard_config` aynı yardımcıları kullanır
+  (`_read_json`, `_check_address`): iki kopya zamanla birbirinden ayrılırdı. Karşılığında Level 2
+  kodu değişti; mevcut testler bu değişikliği güvence altına aldı.
+- *Sözleşme testi.* `config.py` izin verilen yerleştirme adlarını listeler, `ring.py` uygular;
+  bir test ikisinin uyuştuğunu doğrular (iki dosya arası arayüz sözleşmesi).
+
+**Öğrenilenler**
+- Mutasyon denemesi: 19 bilerek bozulmuş sürümün hepsini testler yakaladı (protokol/config 9, client 10).
+- Yeni testler `KVClient.close()` içinde var olan bir hatayı ortaya çıkardı: `makefile()` okuyucusu
+  kapatılmıyordu, dosya tanıtıcısı çöp toplamaya kadar açık kalıyordu (ResourceWarning).
+- Betik farkı: PowerShell ile `Get-Content` kodlamayı belirtmeden okuyunca Türkçe karakterler bozuldu;
+  `-Encoding utf8` gerekti. Ekip Windows'ta çalıştığı için komutlar kabuğa göre belgelenmeli.

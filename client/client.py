@@ -1,11 +1,13 @@
 """
 Key-Value-Store client'ı.
 
-Üç mod:
+Dört mod:
     Tek komut:  python -m client.client --port 5000 SET k1 merhaba dünya
                 python -m client.client --port 5000 GET k1
     Shell:      python -m client.client --port 5000        (komut verilmezse)
     Küme (L2):  python -m client.client --servers servers.json SET k1 merhaba
+    Shard (L3): python -m client.client --cluster servers_level3.json SET k1 merhaba
+                python -m client.client --cluster servers_level3.json --placement modn GET k1
 
 Client satırı olduğu gibi sunucuya gönderir; doğrulamada son söz sunucunundur.
 Küme modunda yalnızca "komut SET mi?" sorusuna bakılır (yönlendirme için).
@@ -15,8 +17,12 @@ import argparse
 import socket
 import sys
 
-from common.config import ConfigError, load_servers, primary_of
-from common.protocol import CMD_SET, ENCODING, encode_line, parse_not_primary, read_line
+from common.config import VALID_PLACEMENTS, ConfigError, load_servers, load_shard_config, primary_of
+from common.protocol import (
+    CMD_GET, CMD_SET, CMD_STATS, ENCODING, RESP_STATS, encode_line, format_stats,
+    parse_not_primary, parse_wrong_node, read_line,
+)
+from common.ring import DEFAULT_VNODES, make_placement, node_id
 
 TIMEOUT = 3.0   # saniye; bağlanma ve cevap bekleme için (docs/protokol.md)
 
@@ -63,11 +69,15 @@ class KVClient:
         self._reader = self._sock.makefile("r", encoding=ENCODING, newline="\n")
 
     def close(self):
-        if self._sock is not None:
-            try:
-                self._sock.close()
-            except OSError:
-                pass
+        # The reader made by makefile() holds its OWN reference to the socket: socket.close()
+        # alone only marks the socket closed, the file descriptor stays open until the reader is
+        # closed too (or garbage collected, which raises a ResourceWarning). So close both.
+        for resource in (self._reader, self._sock):
+            if resource is not None:
+                try:
+                    resource.close()
+                except OSError:
+                    pass
         self._sock = None
         self._reader = None
 
@@ -228,6 +238,157 @@ class ClusterClient:
         raise KVError("Hiçbir sunucuya ulaşılamıyor: " + self._format_addresses(self._addresses))
 
 
+class ShardedClient:
+    """Level 3: sends every command to the server that OWNS the key.
+
+    Rules:
+      SET / GET <key>      -> the owner, chosen by make_placement(...)(key)
+      ERR WRONG_NODE <port>-> the same host, that port; the command is repeated ONCE
+      STATS                -> asked from EVERY server; the answer is "STATS <total>"
+      anything else        -> the FIRST server in the list (no key, nothing to route by:
+                              the server's own validation gives the ERR answer)
+
+    Placement is decided here, in the client (like Level 2's routing). A server that does not
+    own a key answers WRONG_NODE, so a client with an old or different config is corrected
+    instead of silently writing to the wrong place.
+
+    There is NO failover: if the owner is down, the command fails with KVError. That is the
+    known limit of Level 3 (the reason for Level 4's replication).
+
+    The routing code never validates keys or values: the last word belongs to the server.
+    Like KVClient, this class is NOT thread-safe.
+    """
+
+    def __init__(self, servers, placement="ring", vnodes=DEFAULT_VNODES, timeout=TIMEOUT):
+        # servers: the "servers" list of load_shard_config(); the ORDER is kept.
+        # node_id() is the only place that spells a node ("127.0.0.1:5000"): ring and client agree.
+        self._addresses = {}                              # node id -> (host, port), in config order
+        for server in servers:
+            self._addresses[node_id(server["host"], server["port"])] = (server["host"], server["port"])
+        if len(self._addresses) != len(servers):
+            raise ValueError("the same server is listed twice")
+        # An empty list, an unknown mode or bad vnodes make make_placement raise ValueError
+        self._place = make_placement(placement, list(self._addresses), vnodes)
+        self._placement = placement
+        self._timeout = timeout
+        self._clients = {}                                # (host, port) -> KVClient, opened lazily
+
+    def describe(self):
+        """Short name for the user: 'N sunucu, ring (host:port, ...)'."""
+        return f"{len(self._addresses)} sunucu, {self._placement} ({', '.join(self._addresses)})"
+
+    def connect(self):
+        """Check that at least one server is reachable (the early check when the shell opens)."""
+        for addr in self._addresses.values():
+            try:
+                self._client_for(addr).connect()
+                return
+            except KVError:
+                continue
+        raise KVError("Hiçbir sunucuya ulaşılamıyor: " + ", ".join(self._addresses))
+
+    def send_command(self, line):
+        """Route the command and return the answer line; raise KVError if it cannot be done."""
+        parts = line.split(" ", 2)                        # same split as common.protocol.parse_line
+        cmd = parts[0].upper()
+
+        if cmd == CMD_STATS and len(parts) == 1:
+            return self._total_stats()
+
+        if cmd in (CMD_SET, CMD_GET) and len(parts) >= 2 and parts[1]:
+            owner = self._addresses[self._place(parts[1])]
+            return self._send_to_owner(owner, line)
+
+        # No key to route by (or a command that is not routed): any server gives the right ERR
+        first = next(iter(self._addresses.values()))
+        return self._ask(first, line)
+
+    def stats_per_server(self):
+        """{"127.0.0.1:5000": 87, ...} in config order; None for a server with no usable answer."""
+        counts = {}
+        for nid, addr in self._addresses.items():
+            try:
+                counts[nid] = self._parse_stats(self._ask(addr, CMD_STATS))
+            except KVError:
+                counts[nid] = None
+        return counts
+
+    def close(self):
+        for client in self._clients.values():
+            client.close()
+        self._clients.clear()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    # --- internal helpers ----------------------------------------------------------
+
+    def _client_for(self, addr):
+        if addr not in self._clients:
+            self._clients[addr] = KVClient(addr[0], addr[1], timeout=self._timeout)
+        return self._clients[addr]
+
+    def _ask(self, addr, line):
+        return self._client_for(addr).send_command(line)
+
+    def _send_to_owner(self, owner, line):
+        try:
+            response = self._ask(owner, line)
+        except KVError as e:
+            raise KVError(f"Key'in sahibi {node_id(*owner)} sunucusuna ulaşılamıyor "
+                          f"(failover yok): {e}") from e
+
+        port = parse_wrong_node(response)
+        if port is None:
+            return response                               # the normal case: no redirect
+
+        # The server says another port owns the key: ask THAT one, exactly once.
+        redirect = (owner[0], port)
+        try:
+            response = self._ask(redirect, line)
+        except KVError as e:
+            raise KVError(f"{node_id(*owner)} key'in {node_id(*redirect)} sunucusunda "
+                          f"olduğunu söyledi ama oraya ulaşılamıyor: {e}") from e
+        if parse_wrong_node(response) is not None:
+            # No loop: two servers that point at each other would bounce the command forever.
+            # It also means the servers and this client use DIFFERENT configs (a different ring).
+            raise KVError(f"Sunucular key'in sahibi konusunda anlaşamıyor ({node_id(*owner)} ve "
+                          f"{node_id(*redirect)} birbirini gösteriyor): yapılandırma dosyaları farklı olabilir")
+        return response
+
+    @staticmethod
+    def _parse_stats(response):
+        """'STATS <n>' -> n (0 is valid!); anything else -> None."""
+        word, _, number = response.partition(" ")
+        if word == RESP_STATS and number.isascii() and number.isdigit():
+            return int(number)
+        return None
+
+    def _total_stats(self):
+        counts = self.stats_per_server()
+        missing = [nid for nid, count in counts.items() if count is None]
+        if missing:
+            # A total that silently skips a server would look like data was lost.
+            raise KVError("STATS eksik, şu sunuculardan sayı alınamadı: " + ", ".join(missing))
+        return format_stats(sum(counts.values()))
+
+
+def format_stats_report(counts):
+    """Text for the shell's STATS: the total, then one line per server (a dict from stats_per_server)."""
+    known = [count for count in counts.values() if count is not None]
+    missing = len(counts) - len(known)
+    total = f"STATS {sum(known)}"
+    if missing:
+        total += f" (EKSİK: {missing} sunucuya ulaşılamadı)"
+    lines = [total]
+    for nid, count in counts.items():
+        lines.append(f"  {nid}: {'ulaşılamıyor' if count is None else count}")
+    return "\n".join(lines)
+
+
 def run_once(client, line):
     """Tek komut modu. Çıkış kodu: 0 başarılı, 1 sunucu ERR döndü, 2 bağlantı hatası."""
     try:
@@ -261,36 +422,57 @@ def run_shell(client):
             continue
 
         try:
-            print(client.send_command(line))
+            if line.strip().upper() == CMD_STATS and hasattr(client, "stats_per_server"):
+                print(format_stats_report(client.stats_per_server()))   # sharded: total + per server
+            else:
+                print(client.send_command(line))
         except KVError as e:
             # Bağlantı kapandı; bir sonraki komutta yeniden bağlanmayı deneyecek
             print(f"Hata: {e}", file=sys.stderr)
     return 0
 
 
+def build_client(args):
+    """Create the client the command line asks for. Raises ConfigError for a bad config file."""
+    if args.cluster:
+        config = load_shard_config(args.cluster)
+        # --placement overrides the file (the measurement scripts compare both modes)
+        return ShardedClient(config["servers"], placement=args.placement or config["placement"],
+                             vnodes=config["vnodes"])
+    if args.servers:
+        return ClusterClient(load_servers(args.servers))
+    return KVClient(args.host, args.port)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Key-Value-Store client'ı")
     parser.add_argument("--host", default="127.0.0.1", help="sunucu adresi (varsayılan: 127.0.0.1)")
     parser.add_argument("--port", type=int, help="sunucu portu (tek sunucu modu)")
-    parser.add_argument("--servers", help="servers.json yolu (küme modu; --port ile birlikte kullanılmaz)")
+    parser.add_argument("--servers", help="servers.json yolu (Level 2 küme modu; --port ile birlikte kullanılmaz)")
+    parser.add_argument("--cluster", help="servers_level3.json yolu (Level 3 sharding; --port ve --servers ile "
+                                          "birlikte kullanılmaz)")
+    parser.add_argument("--placement", choices=VALID_PLACEMENTS,
+                        help="dosyadaki yerleştirmeyi geçersiz kıl (yalnızca --cluster ile)")
     parser.add_argument("command", nargs=argparse.REMAINDER,
                         help="tek komut, ör. SET k1 merhaba; verilmezse shell açılır")
     args = parser.parse_args()
 
-    # Tam olarak biri gerekli: --port (Level 1 davranışı) ya da --servers (küme modu)
-    if args.servers and args.port is not None:
-        parser.error("--servers ve --port birlikte kullanılamaz")
-    if not args.servers and args.port is None:
-        parser.error("--port ya da --servers gerekli")
+    # Tam olarak biri gerekli: --port (Level 1), --servers (Level 2) ya da --cluster (Level 3)
+    chosen = [name for name, given in (("--port", args.port is not None),
+                                       ("--servers", bool(args.servers)),
+                                       ("--cluster", bool(args.cluster))) if given]
+    if len(chosen) > 1:
+        parser.error(" ve ".join(chosen) + " birlikte kullanılamaz")
+    if not chosen:
+        parser.error("--port, --servers ya da --cluster gerekli")
+    if args.placement and not args.cluster:
+        parser.error("--placement yalnızca --cluster ile kullanılabilir")
 
-    if args.servers:
-        try:
-            client = ClusterClient(load_servers(args.servers))
-        except ConfigError as e:
-            print(f"Hata: {e}", file=sys.stderr)       # traceback değil, anlaşılır mesaj
-            raise SystemExit(2)
-    else:
-        client = KVClient(args.host, args.port)
+    try:
+        client = build_client(args)
+    except ConfigError as e:
+        print(f"Hata: {e}", file=sys.stderr)           # traceback değil, anlaşılır mesaj
+        raise SystemExit(2)
 
     with client:
         if args.command:
