@@ -298,3 +298,13 @@
   kapatılmıyordu, dosya tanıtıcısı çöp toplamaya kadar açık kalıyordu (ResourceWarning).
 - Betik farkı: PowerShell ile `Get-Content` kodlamayı belirtmeden okuyunca Türkçe karakterler bozuldu;
   `-Encoding utf8` gerekti. Ekip Windows'ta çalıştığı için komutlar kabuğa göre belgelenmeli.
+
+
+
+## 2026-11-26 (Öğrenci1, Level 3: kapanış)
+
+- **Tamamlandı:** `server.py`'deki geçici yedekler (`TODO(Level 3)` bloğu, `format_wrong_node` ve `load_shard_config`) silindi; ikisi artık doğrudan `common.protocol` ve `common.config`'ten import ediliyor. Yalnızca yedeğin kullandığı `import json` ve `DEFAULT_VNODES` da kaldırıldı. `test_server.py`'deki `TestLoadShardConfig` artık Öğrenci2'nin gerçek fonksiyonunu sınıyor ve değişmeden geçiyor; yani yedek sözleşmeye uygun yazılmıştı.
+- **Kontrol:** `start_cluster` geçici olarak bu yedeği `server.py`'den import ediyordu (Öğrenci3, 25.11). Öğrenci3 bunu 26.11'de `common.config`'e çevirmişti; silme sonrası hiçbir dosya `server.py`'ye bu yolla bağlı değil.
+- **Gözlem (gerçek küme: `start_cluster --config servers_level3.json` + `ShardedClient`):** 600 `SET`'in hepsi `OK`; sunuculara 207 / 191 / 202 dağıldı, client'ın toplam `STATS`'ı 600. 60 key, sahibi olmayan sunucularda doğrudan sorulunca 120 isteğin 120'si `ERR WRONG_NODE` aldı. Sunucu, Öğrenci2'nin client'ı ve Öğrenci3'ün küme betiği birlikte doğru çalışıyor.
+- **Test:** Windows'ta 287 test geçti (235 sn). Süre, yeni küme testleri ve Windows'un kapalı porta bağlanmayı ancak timeout ile reddetmesi yüzünden uzun; aynı testler Linux'ta 19 sn sürüyor.
+- **Açık (Level 3'ten bağımsız):** `server.py`'de Level 2'den kalan `TODO: translate log and help texts from Turkish`. Türkçe log ve `--help` metinleri başka dosyalarda da var; teslimden önce ekipçe tek seferde çevrilecek.
