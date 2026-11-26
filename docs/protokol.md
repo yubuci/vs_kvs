@@ -4,7 +4,7 @@
 > Paralel çalışmanın tek şartı bu belgedir: client'ı yazan ile sunucuyu yazan kişi birbirini beklemeden, yalnızca buna bakarak çalışabilmelidir.
 > Değişiklikler yalnızca Pull Request ile ve üç kişinin onayıyla yapılır. Her değişiklik en alttaki **Değişiklik geçmişi** bölümüne yazılır.
 
-**Sürüm:** 1.1 (18.11.2026)
+**Sürüm:** 1.2 (26.11.2026)
 
 ---
 
@@ -228,6 +228,7 @@ python -m client.client --servers servers.json GET k1
 |---|---|---|---|
 | 13.11.2026 | 1.0 | İlk sürüm | |
 | 18.11.2026 | 1.1 | `SYNC <port>` (argümansız `SYNC` artık geçersiz); `REPL`/`ENTRY`/`END` ayrıştırma kuralları; `seq` ve `port` yalnızca ASCII rakam, ≥ 1, `port` ≤ 65535; `REPL` kontrol sırası (komut, seq, key, value); satır uzunluğu hesabı (4122/4123); `ERR NOT_PRIMARY <port>` biçimi; client `--servers` yönlendirme kuralları | Öğrenci2 |
+| 26.11.2026 | 1.2 | `ERR WRONG_NODE <port>`; sharding kuralları (her key yalnızca sahibinde, yerleştirme `common/ring.py` içindeki `make_placement`, düğüm kimliği `host:port`); sunucu `--cluster` / `--placement` / `--vnodes` | Öğrenci2 |
 
 
 ## Sürüm 1.2 (Level 3): sharding
