@@ -17,10 +17,10 @@ from client.client import KVClient
 from common.protocol import (
     ERR_FULL, ERR_KEY, ERR_UNKNOWN, MAX_KEYS, RESP_END, encode_line, format_sync, parse_entry,
 )
-from common.config import ConfigError
+from common.config import ConfigError, load_shard_config
 from common.ring import HashRing, modn_node_for
 from server.server import (
-    ROLE_BACKUP, ROLE_PRIMARY, Node, cluster_settings, execute, handle_client, load_shard_config,
+    ROLE_BACKUP, ROLE_PRIMARY, Node, cluster_settings, execute, handle_client,
     parse_addr, parse_peers, serve,
 )
 from server.store import Store
@@ -296,7 +296,7 @@ class TestClusterSettings(unittest.TestCase):
 
 
 class TestLoadShardConfig(unittest.TestCase):
-    """load_shard_config, whichever version is in use (stand-in in server.py or Öğrenci2's)."""
+    """load_shard_config as the server uses it (the cases --cluster relies on)."""
 
     def write(self, data):
         fd, path = tempfile.mkstemp(suffix=".json")

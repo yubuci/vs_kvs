@@ -19,7 +19,6 @@ Run (from the repository root):
 """
 
 import argparse
-import json
 import logging
 import socket
 import threading
@@ -28,65 +27,13 @@ from common.protocol import (
     CMD_GET, CMD_REPL, CMD_SET, CMD_STATS, CMD_SYNC, ENCODING, ERR_UNKNOWN, ERR_VALUE,
     RESP_NOT_FOUND, RESP_OK,
     LineTooLongError, encode_line, format_not_primary, format_stats, format_value,
-    parse_line, read_line,
+    format_wrong_node, parse_line, read_line,
 )
-from common.config import ConfigError
-from common.ring import DEFAULT_VNODES, make_placement, node_id
+from common.config import ConfigError, load_shard_config
+from common.ring import make_placement, node_id
 from server.replication import Replicator
 from server.store import Store
 from server.sync import pull_sync, serve_sync
-
-# ---------------------------------------------------------------------------------------------
-# TODO(Level 3): temporary stand-ins. Remove this whole block once Öğrenci2's changes
-# (protocol 1.2: format_wrong_node; config: load_shard_config) are in this branch, and import
-# the two functions directly. While the real functions exist, the "try" succeeds and the
-# stand-ins below are never used. They follow the contract in level3_gorevler, sections 3.2-3.3.
-# ---------------------------------------------------------------------------------------------
-try:
-    from common.protocol import format_wrong_node
-except ImportError:
-    def format_wrong_node(port):
-        """Stand-in: "ERR WRONG_NODE 5001"."""
-        return f"ERR WRONG_NODE {port}"
-
-try:
-    from common.config import load_shard_config
-except ImportError:
-    def load_shard_config(path="servers_level3.json"):
-        """Stand-in: read servers_level3.json -> {"placement", "vnodes", "servers": [{"host", "port"}]}."""
-        try:
-            with open(path, encoding="utf-8") as f:
-                data = json.load(f)
-        except FileNotFoundError:
-            raise ConfigError(f"Config file not found: {path}") from None
-        except (OSError, ValueError) as e:
-            raise ConfigError(f"Cannot read config file {path}: {e}") from e
-        if not isinstance(data, dict) or not isinstance(data.get("servers"), list) or not data["servers"]:
-            raise ConfigError(f'Config file {path} must contain a non-empty "servers" list')
-        placement = data.get("placement", "ring")
-        vnodes = data.get("vnodes", DEFAULT_VNODES)
-        if placement not in ("ring", "modn"):
-            raise ConfigError(f'{path}: "placement" must be "ring" or "modn", got {placement!r}')
-        if isinstance(vnodes, bool) or not isinstance(vnodes, int) or vnodes < 1:
-            raise ConfigError(f'{path}: "vnodes" must be an integer >= 1, got {vnodes!r}')
-        servers, seen = [], set()
-        for i, entry in enumerate(data["servers"]):
-            where = f"{path}, server #{i + 1}"
-            if not isinstance(entry, dict):
-                raise ConfigError(f"{where}: must be an object with host and port")
-            if "role" in entry:
-                raise ConfigError(f'{where}: has a "role" field; this looks like a Level 2 file (servers.json)')
-            host, port = entry.get("host"), entry.get("port")
-            if not isinstance(host, str) or not host:
-                raise ConfigError(f'{where}: "host" must be a non-empty string')
-            if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
-                raise ConfigError(f'{where}: "port" must be an integer from 1 to 65535, got {port!r}')
-            if (host, port) in seen:
-                raise ConfigError(f"{where}: {host}:{port} is listed twice")
-            seen.add((host, port))
-            servers.append({"host": host, "port": port})
-        return {"placement": placement, "vnodes": vnodes, "servers": servers}
-# ------------------------------- end of temporary stand-ins ----------------------------------
 
 log = logging.getLogger("server")
 
