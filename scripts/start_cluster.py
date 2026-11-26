@@ -30,13 +30,7 @@ import time
 
 from client.client import KVClient, KVError
 
-# TODO(Level 3): Öğrenci2'nin common/config.py'sine load_shard_config gelince yalnızca
-# ilk import kalır. O zamana kadar Öğrenci1'in server.py'deki geçici yedeği kullanılır
-# (aynı sözleşme, docs/level3_gorevler.md 3.3); kod iki yerde yazılmasın diye kopyalanmadı.
-try:
-    from common.config import ConfigError, load_shard_config
-except ImportError:
-    from server.server import ConfigError, load_shard_config
+from common.config import ConfigError, load_servers, load_shard_config
 
 # Depo kökü: betik nereden çağrılırsa çağrılsın sunucular buradan başlatılır
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -60,18 +54,16 @@ class ClusterError(Exception):
 # ---------------------------------------------------------------------------
 
 def load_config(path):
-    """Sunucu listesini okur. Dosya yoksa varsayılan kümeyi döndürür.
+    """Level 2 sunucu listesini okur (common.config.load_servers ile doğrulanmış).
 
-    TODO: Öğrenci2'nin common/config.py'si main'e gelince load_servers() kullanılacak.
+    Dosya yoksa varsayılan kümeyi döndürür. Dönüş: (sunucular, dosyadan_mı).
     """
     if not os.path.exists(path):
         return [dict(s) for s in DEFAULT_SERVERS], False
     try:
-        with open(path, encoding="utf-8") as f:
-            servers = json.load(f)["servers"]
-    except (OSError, ValueError, KeyError, TypeError) as e:
-        raise ClusterError(f"{path} okunamadı: {e}") from e
-    return servers, True
+        return load_servers(path), True
+    except ConfigError as e:
+        raise ClusterError(str(e)) from e
 
 
 def check_config(servers, replication):
